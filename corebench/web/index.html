@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>corebench 钻孔档案抽取工作台</title>
+<style>
+:root { --line:#d7dde5; --bg:#f5f7fa; --brand:#1f5fa8; --ok:#1d7a3d; --warn:#b26a00; --err:#b3261e; }
+* { box-sizing: border-box; }
+body { margin:0; font-family: "PingFang SC","Microsoft YaHei",system-ui,sans-serif; background:var(--bg); color:#1d2733; }
+header { background:var(--brand); color:#fff; padding:12px 20px; display:flex; align-items:center; gap:16px; }
+header h1 { font-size:18px; margin:0; }
+nav { display:flex; gap:4px; background:#fff; border-bottom:1px solid var(--line); padding:0 12px; }
+nav button { background:none; border:none; padding:12px 16px; font-size:14px; cursor:pointer; color:#41505f; border-bottom:3px solid transparent; }
+nav button.active { color:var(--brand); border-bottom-color:var(--brand); font-weight:600; }
+main { padding:18px 22px; max-width:1280px; margin:0 auto; }
+.panel { display:none; }
+.panel.active { display:block; }
+.card { background:#fff; border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:16px; }
+.card h2 { font-size:15px; margin:0 0 12px; }
+textarea { width:100%; min-height:340px; font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13px;
+  border:1px solid var(--line); border-radius:6px; padding:10px; line-height:1.5; }
+input[type=text], select { padding:7px 9px; border:1px solid var(--line); border-radius:6px; font-size:13px; min-width:200px; }
+button.primary { background:var(--brand); color:#fff; border:none; border-radius:6px; padding:8px 16px; cursor:pointer; font-size:13px; }
+button.ghost { background:#fff; border:1px solid var(--line); border-radius:6px; padding:7px 14px; cursor:pointer; font-size:13px; }
+button:disabled { opacity:.5; cursor:not-allowed; }
+.row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+table.grid { border-collapse:collapse; width:100%; font-size:12.5px; }
+table.grid th, table.grid td { border:1px solid var(--line); padding:6px 8px; text-align:left; vertical-align:top; }
+table.grid th { background:#eef2f7; }
+.tag { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11.5px; font-weight:600; }
+.tag.completed { background:#e2f3e8; color:var(--ok); }
+.tag.failed { background:#fbe4e2; color:var(--err); }
+.tag.running { background:#e6efff; color:var(--brand); }
+.tag.pending { background:#eceff3; color:#5a6a78; }
+.tag.censored { background:#fff1db; color:var(--warn); }
+.tag.zero { background:#e8f0fe; color:var(--brand); }
+.tag.missing { background:#eceff3; color:#5a6a78; }
+.tag.number { background:#e2f3e8; color:var(--ok); }
+.tag.conflict { background:#fbe4e2; color:var(--err); }
+.diff-add { color:var(--ok); font-weight:600; }
+.diff-del { color:var(--err); text-decoration:line-through; }
+.diff-chg { color:var(--warn); font-weight:600; }
+.muted { color:#788696; font-size:12px; }
+pre.raw { background:#0f1722; color:#d8e2ee; padding:12px; border-radius:6px; overflow:auto; max-height:360px; font-size:12px; }
+.toast { position:fixed; right:20px; bottom:20px; background:#1d2733; color:#fff; padding:10px 16px; border-radius:6px; font-size:13px; opacity:0; transition:opacity .25s; }
+.toast.show { opacity:1; }
+.badge { background:#fbe4e2; color:var(--err); border-radius:10px; padding:1px 8px; font-size:11px; font-weight:700; }
+details { margin-top:8px; }
+summary { cursor:pointer; font-weight:600; font-size:13px; }
+code { background:#eef2f7; padding:1px 5px; border-radius:4px; }
+</style>
+</head>
+<body>
+<header><h1>corebench · 钻孔档案网页抽取工作台</h1><span class="muted" style="color:#cfe0f5">声明式规则 · 快照回放 · 语义差异 · 基线确认</span></header>
+<nav>
+  <button data-tab="rules" class="active">规则编辑与版本</button>
+  <button data-tab="runs">采集与回放</button>
+  <button data-tab="diff">差异查看</button>
+  <button data-tab="baselines">基线确认</button>
+</nav>
+<main>
+  <!-- ============================ rules ============================ -->
+  <section id="panel-rules" class="panel active">
+    <div class="card">
+      <h2>规则文本（声明式 DSL，调整结构无需改 Python）</h2>
+      <div class="row">
+        <label>规则名 <input type="text" id="rule-name" value="drill-archive"></label>
+        <label>版本说明 <input type="text" id="rule-note" placeholder="本次修改说明"></label>
+        <button class="primary" id="btn-save-rule">保存为新版本</button>
+        <button class="ghost" id="btn-validate">校验语法</button>
+      </div>
+      <textarea id="rule-editor" spellcheck="false"></textarea>
+      <div id="rule-validate" class="muted" style="margin-top:8px"></div>
+    </div>
+    <div class="card">
+      <h2>已保存版本</h2>
+      <table class="grid" id="rule-versions"><thead><tr>
+        <th>规则 ID</th><th>版本号</th><th>说明</th><th>保存时间</th><th>操作</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- ============================ runs ============================ -->
+  <section id="panel-runs" class="panel">
+    <div class="card">
+      <h2>启动采集（页面清单为 JSON：page_id + url）</h2>
+      <div class="row">
+        <label>运行 ID <input type="text" id="run-id"></label>
+        <label>规则版本 <select id="run-rule"></select></label>
+        <button class="primary" id="btn-start">启动 / 续跑</button>
+        <button class="ghost" id="btn-refresh-runs">刷新</button>
+      </div>
+      <textarea id="run-pages" spellcheck="false" style="min-height:150px"></textarea>
+    </div>
+    <div class="card">
+      <h2>运行状态（失败运行不会替换已确认基线；检查点支持中断续跑）</h2>
+      <table class="grid" id="runs-table"><thead><tr>
+        <th>运行 ID</th><th>规则</th><th>状态</th><th>冲突</th><th>警告</th><th>快照</th><th>开始</th><th>操作</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+    <div class="card">
+      <h2>抽取结果（JSON Lines，可追溯到原页与原始内容）</h2>
+      <div id="run-output"></div>
+    </div>
+  </section>
+
+  <!-- ============================ diff ============================ -->
+  <section id="panel-diff" class="panel">
+    <div class="card">
+      <h2>在同一完整快照上比较两版规则</h2>
+      <div class="row">
+        <label>基线 <select id="diff-baseline"></select></label>
+        <label>候选运行 <select id="diff-candidate"></select></label>
+        <button class="primary" id="btn-diff">生成差异报告</button>
+        <button class="ghost" id="btn-export">导出机器可读报告</button>
+      </div>
+      <div id="diff-summary" class="muted"></div>
+    </div>
+    <div class="card" id="diff-results"></div>
+  </section>
+
+  <!-- ========================= baselines ========================= -->
+  <section id="panel-baselines" class="panel">
+    <div class="card">
+      <h2>确认基线（仅完整、无冲突的成功回放可确认）</h2>
+      <div class="row">
+        <label>运行 ID <select id="baseline-run"></select></label>
+        <label>说明 <input type="text" id="baseline-note"></label>
+        <button class="primary" id="btn-confirm-baseline">确认为基线</button>
+      </div>
+      <p class="muted">存在矛盾测量、快照不完整或运行未完成时，确认会被阻止。</p>
+    </div>
+    <div class="card">
+      <h2>已确认基线</h2>
+      <table class="grid" id="baselines-table"><thead><tr>
+        <th>基线 ID</th><th>来源运行</th><th>规则</th><th>快照</th><th>确认时间</th><th>说明</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
