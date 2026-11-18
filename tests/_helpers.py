@@ -14,11 +14,12 @@ if ROOT not in sys.path:
 FIXTURES = os.path.join(ROOT, "tests", "fixtures")
 RULE_V1 = os.path.join(FIXTURES, "rules", "rule_v1.dsl")
 RULE_V2 = os.path.join(FIXTURES, "rules", "rule_v2.dsl")
+RULE_V3 = os.path.join(FIXTURES, "rules", "rule_v3.dsl")
 EXPECTED = os.path.join(FIXTURES, "expected", "expected.jsonl")
 
 
 def rule_text(version: int) -> str:
-    path = RULE_V1 if version == 1 else RULE_V2
+    path = {1: RULE_V1, 2: RULE_V2, 3: RULE_V3}[version]
     with open(path, encoding="utf-8") as handle:
         return handle.read()
 

@@ -4,7 +4,10 @@ Two rule versions are compared on the **same** complete snapshot.  The diff
 understands the business records (interval / sample / measurement) rather than
 raw text, so these are *not* reported as data changes:
 
-* field renames (the output keeps a stable canonical field name);
+* field renames declared via ``renamed_from`` in the rule (the new JSONL is
+  written with the new field name; the rule's output schema, embedded in every
+  JSONL document, lets the diff match the same business field across runs,
+  including renamed identity fields such as a sample code);
 * list reordering (records are matched by identity, then compared);
 * equivalent unit expressions (values compare after unit normalisation).
 
@@ -93,17 +96,136 @@ def _source_ref(provenance: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
 
 
 # ---------------------------------------------------------------- flattening
-def _index_documents(rows: List[Dict[str, Any]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
-    index: Dict[Tuple[str, str], Dict[str, Any]] = {}
+# Record kinds map to the rule table whose declared identity produced them.
+_RECORD_TABLES = {
+    "interval": "interval_table",
+    "sample": "sample_table",
+    "measurement": "assay_table",
+}
+
+
+def _schema_of(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return the most complete embedded output schema found in a run."""
+    schema: Dict[str, Any] = {"tables": {}}
+    for row in rows:
+        embedded = row.get("schema")
+        if not embedded:
+            continue
+        for table_key, table_schema in embedded.get("tables", {}).items():
+            schema["tables"].setdefault(table_key, table_schema)
+    return schema
+
+
+def _table_rename_map(schema: Dict[str, Any], table_key: str) -> Dict[str, str]:
+    """Historical field name -> current field name for one table."""
+    table = schema.get("tables", {}).get(table_key) or {}
+    mapping: Dict[str, str] = {}
+    for current_name, meta in table.get("fields", {}).items():
+        for old_name in meta.get("renamed_from", []) or []:
+            mapping[old_name] = current_name
+    return mapping
+
+
+def _build_rename_context(old_rows: List[Dict[str, Any]],
+                         new_rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    """Merge both runs' embedded schemas into per-table old-name -> new-name maps.
+
+    The candidate (new) run is authoritative; a baseline produced by an older
+    rule contributes its own historical names so a rename chain spanning more
+    than one rule version still resolves.
+    """
+    old_schema = _schema_of(old_rows)
+    new_schema = _schema_of(new_rows)
+    context: Dict[str, Dict[str, str]] = {}
+    for table_key in set(old_schema["tables"]) | set(new_schema["tables"]):
+        mapping: Dict[str, str] = {}
+        mapping.update(_table_rename_map(old_schema, table_key))
+        mapping.update(_table_rename_map(new_schema, table_key))
+        context[table_key] = mapping
+    return context
+
+
+def _split_identity(identity: str) -> List[Tuple[str, str]]:
+    """Split ``sample_id=S101|analyte=Au`` into [(name, value), ...]."""
+    parts: List[Tuple[str, str]] = []
+    for chunk in identity.split("|"):
+        if "=" not in chunk:
+            continue
+        name, _, value = chunk.partition("=")
+        parts.append((name, value))
+    return parts
+
+
+def _canonical_identity(record_type: str, identity: str,
+                        rename_context: Dict[str, Dict[str, str]]) -> Tuple[Tuple[str, str], ...]:
+    """Position/value based identity immune to identity-field renames.
+
+    A sample record keyed by ``sample_id=S101`` in the baseline and
+    ``sample_code=S101`` in the candidate yields the same canonical key, so the
+    assay measurements still attach to the original sample.  Measurement
+    identities historically use the bare token ``sample``; that alias is
+    normalised to the rule's current sample field name.
+    """
+    parts = _split_identity(identity)
+    table_key = _RECORD_TABLES.get(record_type)
+    rename = dict(rename_context.get(table_key or "", {}))
+    if record_type == "measurement":
+        current_sample = _current_sample_field(rename_context)
+        rename.setdefault("sample", current_sample)
+        rename.setdefault("sample_id", current_sample)
+    canonical: List[Tuple[str, str]] = []
+    for name, value in parts:
+        canonical.append((rename.get(name, name), value))
+    return tuple(canonical)
+
+
+def _current_sample_field(rename_context: Dict[str, Dict[str, str]]) -> str:
+    assay = rename_context.get("assay_table", {})
+    if "sample_id" in assay:
+        return assay["sample_id"]
+    return "sample_id"
+
+
+def _index_documents(rows: List[Dict[str, Any]],
+                     rename_context: Dict[str, Dict[str, str]]
+                     ) -> Dict[Tuple[str, str, Tuple[Tuple[str, str], ...]], Dict[str, Any]]:
+    index: Dict[Tuple[str, str, Tuple[Tuple[str, str], ...]], Dict[str, Any]] = {}
     for row in rows:
         borehole = row["borehole_id"]
         for interval in row.get("intervals", []):
-            index[(borehole, f"interval::{interval['identity']}")] = interval
+            key = (borehole, "interval",
+                   _canonical_identity("interval", interval["identity"], rename_context))
+            index[key] = interval
         for sample in row.get("samples", []):
-            index[(borehole, f"sample::{sample['identity']}")] = sample
+            key = (borehole, "sample",
+                   _canonical_identity("sample", sample["identity"], rename_context))
+            index[key] = sample
         for measurement in row.get("measurements", []):
-            index[(borehole, f"measurement::{measurement['identity']}")] = measurement
+            key = (borehole, "measurement",
+                   _canonical_identity("measurement", measurement["identity"], rename_context))
+            index[key] = measurement
     return index
+
+
+def _display_identity(record_type: str, identity: str,
+                      rename_context: Dict[str, Dict[str, str]]) -> str:
+    """Rewrite an old-style identity string to current field names."""
+    table_key = _RECORD_TABLES.get(record_type)
+    rename = dict(rename_context.get(table_key or "", {}))
+    if record_type == "measurement":
+        current_sample = _current_sample_field(rename_context)
+        rename.setdefault("sample", current_sample)
+        rename.setdefault("sample_id", current_sample)
+    if not rename:
+        return identity
+    rewritten = []
+    for chunk in identity.split("|"):
+        if "=" not in chunk:
+            rewritten.append(chunk)
+            continue
+        name, _, value = chunk.partition("=")
+        rewritten.append(f"{rename.get(name, name)}={value}")
+    return "|".join(rewritten)
 
 
 def _all_warnings(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -116,27 +238,36 @@ def _all_warnings(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 # ------------------------------------------------------------------- compare
 def compare_runs(old_rows: List[Dict[str, Any]], new_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    old_index = _index_documents(old_rows)
-    new_index = _index_documents(new_rows)
+    rename_context = _build_rename_context(old_rows, new_rows)
+    old_index = _index_documents(old_rows, rename_context)
+    new_index = _index_documents(new_rows, rename_context)
     changes: List[RecordChange] = []
 
-    for key in sorted(set(old_index) | set(new_index)):
+    for key in sorted(set(old_index) | set(new_index), key=lambda k: (k[0], k[1], k[2])):
+        _borehole, record_type, _canonical = key
         if key not in old_index:
-            changes.append(RecordChange(_record_type(key), key[1], CHANGE_ADDED,
-                                        new_provenance=new_index[key].get("provenance")))
+            new_record = new_index[key]
+            changes.append(RecordChange(record_type,
+                                        _display_identity(record_type, new_record["identity"], rename_context),
+                                        CHANGE_ADDED,
+                                        new_provenance=new_record.get("provenance")))
             continue
         if key not in new_index:
             old_record = old_index[key]
             category = CHANGE_REMOVED
-            if _record_disappeared_due_to_failure(key, old_record, new_rows):
+            if _record_disappeared_due_to_failure(old_record, new_rows):
                 category = CHANGE_FAILED
-            changes.append(RecordChange(_record_type(key), key[1], category,
+            changes.append(RecordChange(record_type,
+                                        _display_identity(record_type, old_record["identity"], rename_context),
+                                        category,
                                         old_provenance=old_record.get("provenance")))
             continue
-        field_changes = _compare_records(key, old_index[key], new_index[key])
+        field_changes = _compare_records(record_type, old_index[key], new_index[key], rename_context)
         if field_changes:
             changes.append(RecordChange(
-                _record_type(key), key[1], "changed", field_changes,
+                record_type,
+                _display_identity(record_type, new_index[key]["identity"], rename_context),
+                "changed", field_changes,
                 old_index[key].get("provenance"), new_index[key].get("provenance"),
             ))
 
@@ -151,11 +282,7 @@ def compare_runs(old_rows: List[Dict[str, Any]], new_rows: List[Dict[str, Any]])
     }
 
 
-def _record_type(key: Tuple[str, str]) -> str:
-    return key[1].split("::", 1)[0]
-
-
-def _record_disappeared_due_to_failure(key, old_record, new_rows) -> bool:
+def _record_disappeared_due_to_failure(old_record, new_rows) -> bool:
     for row in new_rows:
         for warning in row.get("warnings", []):
             if warning.get("code") in ("EXTRACTION_FAILED", "TABLE_NOT_FOUND"):
@@ -164,17 +291,34 @@ def _record_disappeared_due_to_failure(key, old_record, new_rows) -> bool:
     return False
 
 
-def _compare_records(key, old_record: Dict[str, Any], new_record: Dict[str, Any]) -> List[FieldChange]:
+def _compare_records(record_type: str, old_record: Dict[str, Any],
+                     new_record: Dict[str, Any],
+                     rename_context: Dict[str, Dict[str, str]]) -> List[FieldChange]:
     changes: List[FieldChange] = []
+    table_key = _RECORD_TABLES.get(record_type, "")
+    rename = rename_context.get(table_key, {})
+
     if "fields" in old_record or "fields" in new_record:
         old_fields = old_record.get("fields", {})
         new_fields = new_record.get("fields", {})
-        for field_name in sorted(set(old_fields) | set(new_fields)):
-            change = _compare_field(field_name, old_fields.get(field_name), new_fields.get(field_name),
-                                    old_record.get("provenance"), new_record.get("provenance"))
+        # Align on the *current* field names: an old-only name is translated via
+        # the rename map so a pure rename compares equal instead of looking like
+        # a removal plus an addition.  Genuinely unknown old names stay untouched
+        # and are reported as removals.
+        aligned_old: Dict[str, Any] = {}
+        for field_name, value in old_fields.items():
+            aligned_old[rename.get(field_name, field_name)] = value
+        for field_name in sorted(set(aligned_old) | set(new_fields)):
+            old_name = _reverse_rename(rename, field_name)
+            change = _compare_field(field_name, aligned_old.get(field_name),
+                                    new_fields.get(field_name),
+                                    old_record.get("provenance"),
+                                    new_record.get("provenance"),
+                                    old_name=old_name)
             if change:
                 changes.append(change)
-    if key[1].startswith("measurement::"):
+
+    if record_type == "measurement":
         change = _compare_field("value", old_record.get("value"), new_record.get("value"),
                                 old_record.get("provenance"), new_record.get("provenance"))
         if change:
@@ -186,26 +330,46 @@ def _compare_records(key, old_record: Dict[str, Any], new_record: Dict[str, Any]
     return changes
 
 
-def _compare_field(field_name, old, new, old_prov, new_prov) -> Optional[FieldChange]:
+def _reverse_rename(rename: Dict[str, str], current_name: str) -> Optional[str]:
+    """The historical name (if any) that was renamed to ``current_name``."""
+    for old_name, new_name in rename.items():
+        if new_name == current_name and old_name != current_name:
+            return old_name
+    return None
+
+
+def _compare_field(field_name, old, new, old_prov, new_prov,
+                   old_name: Optional[str] = None) -> Optional[FieldChange]:
+    rename_note = ""
+    if old_name and old_name != field_name:
+        rename_note = f"renamed from {old_name!r}"
     if old is None and new is None:
         return None
     if old is None:
-        return FieldChange(CHANGE_ADDED, field_name, new=new, new_source=new_prov)
+        return FieldChange(CHANGE_ADDED, field_name, new=new, new_source=new_prov,
+                           detail=rename_note)
     if new is None:
-        return FieldChange(CHANGE_REMOVED, field_name, old=old, old_source=old_prov)
+        # The field is reported under its current name so the report always
+        # points at one stable vocabulary; the detail keeps the old name.
+        return FieldChange(CHANGE_REMOVED, field_name, old=old, old_source=old_prov,
+                           detail=rename_note)
     old_kind, new_kind = old.get("kind"), new.get("kind")
     if old_kind != new_kind:
         return FieldChange(CHANGE_MEANING, field_name, old, new, old_prov, new_prov,
-                           detail=f"kind changed {old_kind} -> {new_kind}")
+                           detail="; ".join(x for x in (rename_note,
+                                                        f"kind changed {old_kind} -> {new_kind}") if x))
     if old.get("unit") != new.get("unit"):
         return FieldChange(CHANGE_MEANING, field_name, old, new, old_prov, new_prov,
-                           detail=f"unit changed {old.get('unit')} -> {new.get('unit')}")
+                           detail="; ".join(x for x in (rename_note,
+                                                        f"unit changed {old.get('unit')} -> {new.get('unit')}") if x))
     if old_kind == "text":
         if old.get("value") != new.get("value"):
-            return FieldChange(CHANGE_VALUE, field_name, old, new, old_prov, new_prov)
+            return FieldChange(CHANGE_VALUE, field_name, old, new, old_prov, new_prov,
+                               detail=rename_note)
         return None
     if not values_equivalent(old, new):
-        return FieldChange(CHANGE_VALUE, field_name, old, new, old_prov, new_prov)
+        return FieldChange(CHANGE_VALUE, field_name, old, new, old_prov, new_prov,
+                           detail=rename_note)
     return None
 
 

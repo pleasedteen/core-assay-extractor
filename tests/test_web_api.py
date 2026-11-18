@@ -129,6 +129,53 @@ class WebApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(fetched["report_id"], report["report_id"])
 
+    def test_07_field_rename_rule_replays_to_empty_diff(self):
+        # A rule that only renames output fields (incl. the sample identity
+        # field) on the same frozen snapshot must not produce data changes,
+        # and the new JSONL must carry the new field names plus a schema.
+        # The rename rule (v3) targets layout-B selectors, so build a clean
+        # layout-B baseline from a local file-source snapshot first.
+        static_dir = tempfile.mkdtemp()
+        manifest_b = [page for page in mock_site.write_static_site(static_dir, layout_b=True)
+                      if "zk02" in page["page_id"]]
+        _, v2 = post(self.base, "/api/rules/save",
+                     {"name": "drill-archive", "text": rule_text(2), "note": "v2 layout-b"})
+        post(self.base, "/api/runs/start",
+             {"run_id": "web-b-base", "rule_id": v2["rule_id"], "pages": manifest_b})
+        post(self.base, "/api/runs/resume", {"run_id": "web-b-base"})
+        status, baseline = post(self.base, "/api/baselines/confirm",
+                                {"run_id": "web-b-base", "note": "layout-b clean"})
+        self.assertEqual(status, 200)
+
+        status, rename_rule = post(self.base, "/api/rules/save",
+                                   {"name": "drill-archive", "text": rule_text(3),
+                                    "note": "v3 output renames"})
+        self.assertEqual(status, 200)
+        status, replay = post(self.base, "/api/runs/replay",
+                              {"run_id": "web-b-base",
+                               "candidate_rule_id": rename_rule["rule_id"],
+                               "new_run_id": "web-b-v3"})
+        self.assertEqual(status, 200)
+        _, output = get_json(self.base, "/api/output?run_id=web-b-v3")
+        doc = output["lines"][0]
+        self.assertIn("schema", doc)
+        self.assertIn("sample_code", doc["samples"][0]["fields"])
+        self.assertNotIn("sample_id", doc["samples"][0]["fields"])
+        status, report = post(self.base, "/api/diff",
+                              {"baseline_id": baseline["baseline_id"],
+                               "candidate_run_id": "web-b-v3"})
+        self.assertEqual(status, 200)
+        self.assertTrue(report["regression_passed"], report["changes"])
+        self.assertEqual(report["summary"]["total"], 0)
+
+    def test_08_invalid_rename_declaration_is_rejected(self):
+        bad = rule_text(3).replace("renamed_from: [sample_id]",
+                                   "renamed_from: [parent_interval]", 1)
+        status, payload = post(self.base, "/api/rules/save",
+                               {"name": "drill-archive", "text": bad, "note": "bad rename"})
+        self.assertEqual(status, 400)
+        self.assertIn("renamed_from", payload["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

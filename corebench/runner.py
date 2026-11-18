@@ -101,7 +101,7 @@ class RunEngine:
 
             extractions = [extract_page(page, rule) for page in
                            sorted(snapshot.pages, key=lambda p: p.page_id)]
-            documents = merge_extractions(extractions)
+            documents = merge_extractions(extractions, rule=rule)
             output_path = self.store.run_output_path(run_id)
             write_jsonl(documents, output_path)
 
@@ -129,7 +129,7 @@ class RunEngine:
         rule = Rule.from_text(text)
         extractions = [extract_page(page, rule) for page in
                        sorted(snapshot.pages, key=lambda p: p.page_id)]
-        documents = merge_extractions(extractions)
+        documents = merge_extractions(extractions, rule=rule)
         replay_id = new_run_id or f"{run_id}-replay-{int(time.time() * 1000)}"
         output_path = self.store.run_output_path(replay_id)
         write_jsonl(documents, output_path)

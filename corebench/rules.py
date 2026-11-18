@@ -7,7 +7,12 @@ Rules are pure data (edited as text, never Python).  A rule describes:
   default units;
 * record identity (which fields make an interval / sample / measurement unique);
 * analyte header aliases, so header text changes stay declarative;
-* how many header layers each table has (multi-row headers).
+* how many header layers each table has (multi-row headers);
+* output field rename history (``renamed_from``): historical output names that
+  denote the same business field as the current field name.  New JSONL is
+  written with the new name; the rule's output schema (embedded in every JSONL
+  document) lets semantic diffs align the field across rule versions --
+  including renamed identity fields -- instead of reporting delete + add.
 
 Changing page structure means editing this text -- no Python changes.
 """
@@ -28,6 +33,7 @@ class FieldSpec:
     type: str = "text"                    # text | depth | concentration
     default_unit: Optional[str] = None
     required: bool = False
+    renamed_from: List[str] = field(default_factory=list)
 
     def matches(self, header_path: Sequence[str]) -> bool:
         return _header_matches(header_path, self.labels)
@@ -60,6 +66,17 @@ class TableSpec:
     header_layers: int = 1
     fields: Dict[str, FieldSpec] = field(default_factory=dict)
     identity: List[str] = field(default_factory=list)
+
+    def rename_map(self) -> Dict[str, str]:
+        """Historical output name -> current output name for this table."""
+        mapping: Dict[str, str] = {}
+        for spec in self.fields.values():
+            for old_name in spec.renamed_from:
+                mapping[old_name] = spec.name
+        return mapping
+
+    def identity_specs(self) -> List[FieldSpec]:
+        return [self.fields[name] for name in self.identity if name in self.fields]
 
 
 @dataclass
@@ -104,6 +121,7 @@ class Rule:
                     type=fdef.get("type", "text"),
                     default_unit=fdef.get("unit"),
                     required=bool(fdef.get("required", False)),
+                    renamed_from=list(fdef.get("renamed_from") or []),
                 )
             tables[key] = TableSpec(
                 key=key,
@@ -112,6 +130,7 @@ class Rule:
                 fields=fields,
                 identity=list(spec.get("identity") or []),
             )
+            _validate_table_renames(key, tables[key])
         analytes: Dict[str, AnalyteSpec] = {}
         for item in data.get("analytes", []):
             analytes[item["code"]] = AnalyteSpec(code=item["code"], labels=list(item.get("labels") or []))
@@ -159,6 +178,87 @@ class Rule:
 
     def to_text(self) -> str:
         return dsl.dump(self.raw)
+
+    # ------------------------------------------------- field rename metadata
+    def field_renames(self) -> Dict[str, Dict[str, str]]:
+        """Per table: historical output field name -> current output name.
+
+        A rename declared here means the two names denote the *same* business
+        field: new JSONL is written with the new name, while diffs against old
+        baselines match the field instead of reporting a delete plus an add.
+        """
+        return {key: table.rename_map() for key, table in self.tables.items()}
+
+    def output_schema(self) -> Dict[str, Any]:
+        """Self-describing output schema, embedded in every JSONL document."""
+        tables: Dict[str, Any] = {}
+        for key, table in self.tables.items():
+            tables[key] = {
+                "identity": list(table.identity),
+                "fields": {
+                    spec.name: {
+                        "type": spec.type,
+                        "renamed_from": list(spec.renamed_from),
+                    }
+                    for spec in table.fields.values()
+                },
+            }
+        return {
+            "rule_version": self.rule_version,
+            "measurement_table": self.measurement_table,
+            "tables": tables,
+        }
+
+    def sample_identity_field(self, table_key: Optional[str] = None) -> str:
+        """The current output name of the assay table's sample identity field.
+
+        Measurement records carry the sample id under this name even when the
+        field was renamed from e.g. ``sample_id`` to ``sample_code``.
+        """
+        table = self.tables[table_key or self.measurement_table]
+        for name in table.identity:
+            if "sample" in name.lower():
+                return name
+        # Fall back to any field whose own/historical name mentions sample.
+        for spec in table.fields.values():
+            if "sample" in spec.name.lower() or any(
+                    "sample" in old.lower() for old in spec.renamed_from):
+                return spec.name
+        return "sample_id"
+
+
+def _validate_table_renames(table_key: str, table: TableSpec) -> None:
+    current_names = set(table.fields)
+    seen_old: Dict[str, str] = {}
+    for spec in table.fields.values():
+        for old_name in spec.renamed_from:
+            if old_name == spec.name:
+                raise ValueError(
+                    f"table {table_key!r} field {spec.name!r}: renamed_from cannot "
+                    f"list its own name")
+            if old_name in current_names:
+                raise ValueError(
+                    f"table {table_key!r} field {spec.name!r}: renamed_from name "
+                    f"{old_name!r} is itself a declared field")
+            if old_name in seen_old:
+                raise ValueError(
+                    f"table {table_key!r}: historical field {old_name!r} is claimed "
+                    f"by both {seen_old[old_name]!r} and {spec.name!r}")
+            seen_old[old_name] = spec.name
+    for identity_name in table.identity:
+        if identity_name not in table.fields:
+            raise ValueError(
+                f"table {table_key!r}: identity field {identity_name!r} is not "
+                f"declared in fields")
+        spec = table.fields[identity_name]
+        for other_name, other in table.fields.items():
+            if other_name == spec.name:
+                continue
+            if spec.name in other.renamed_from or any(
+                    old in other.renamed_from for old in spec.renamed_from):
+                raise ValueError(
+                    f"table {table_key!r}: identity field {spec.name!r} overlaps "
+                    f"with rename chain of {other_name!r}")
 
 
 def _norm(label: str) -> str:

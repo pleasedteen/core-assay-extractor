@@ -9,15 +9,23 @@ its measurements.  Merging is identity based and order independent:
 * repeated contradictory measurements produce a **conflict** that blocks
   baseline confirmation;
 * missing values never overwrite real measurements and vice versa.
+
+When a :class:`~corebench.rules.Rule` is supplied, each emitted document embeds
+the rule's self-describing output schema, including per-field ``renamed_from``
+history, so a later semantic diff can align renamed business fields (and
+renamed identity fields) across rule versions without the rule text.
 """
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from .extractor import PageExtraction
 from .values import values_equivalent
+
+if TYPE_CHECKING:
+    from .rules import Rule
 
 
 @dataclass
@@ -45,9 +53,10 @@ class BoreholeDocument:
     conflicts: List[Conflict] = field(default_factory=list)
     warnings: List[Dict[str, Any]] = field(default_factory=list)
     page_ids: List[str] = field(default_factory=list)
+    schema: Optional[Dict[str, Any]] = None
 
     def to_jsonl_obj(self) -> Dict[str, Any]:
-        return {
+        out = {
             "borehole_id": self.borehole_id,
             "intervals": self.intervals,
             "samples": self.samples,
@@ -56,13 +65,21 @@ class BoreholeDocument:
             "warnings": self.warnings,
             "source_pages": sorted(self.page_ids),
         }
+        if self.schema is not None:
+            # Self-describing field-rename metadata: a diff against an older
+            # baseline can match renamed business fields without the rule text.
+            out["schema"] = self.schema
+        return out
 
 
-def merge_extractions(extractions: List[PageExtraction]) -> List[BoreholeDocument]:
+def merge_extractions(extractions: List[PageExtraction],
+                      rule: Optional["Rule"] = None) -> List[BoreholeDocument]:
     docs: Dict[str, BoreholeDocument] = {}
+    schema = rule.output_schema() if rule is not None else None
     for extraction in sorted(extractions, key=lambda e: e.page_id):  # deterministic; order independent result
         doc = docs.setdefault(extraction.borehole_id or f"unknown:{extraction.page_id}",
-                              BoreholeDocument(borehole_id=extraction.borehole_id or "unknown"))
+                              BoreholeDocument(borehole_id=extraction.borehole_id or "unknown",
+                                               schema=schema))
         doc.page_ids.append(extraction.page_id)
         for warning in extraction.warnings:
             doc.warnings.append(warning.to_dict())

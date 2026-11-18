@@ -126,10 +126,21 @@ $("btn-refresh-runs").addEventListener("click", refreshAll);
 
 async function showOutput(runId) {
   const { lines } = await api(`/api/output?run_id=${encodeURIComponent(runId)}`);
+  // The sample identity field may be renamed between rule versions
+  // (sample_id -> sample_code ...); resolve the current name from the
+  // self-describing output schema, falling back to legacy outputs.
+  const sampleFieldOf = (doc) => {
+    const assay = doc.schema && doc.schema.tables && doc.schema.tables.assay_table;
+    if (assay && Array.isArray(assay.identity) && assay.identity.length) return assay.identity[0];
+    const m = (doc.measurements || [])[0];
+    if (m) return Object.keys(m).find((k) => k.toLowerCase().includes("sample")) || "sample_id";
+    return "sample_id";
+  };
   const html = lines.map((doc) => {
+    const sampleField = sampleFieldOf(doc);
     const conflicts = (doc.conflicts || []).map((c) => `<li class="diff-chg">冲突 ${esc(c.identity)} · ${esc(c.field)}: ${esc(JSON.stringify(c.values))}</li>`).join("");
     const meas = (doc.measurements || []).map((m) => `<tr>
-      <td>${esc(m.sample_id)}</td><td>${esc(m.analyte)}</td><td>${esc(m.method)}</td>
+      <td>${esc(m[sampleField])}</td><td>${esc(m.analyte)}</td><td>${esc(m.method)}</td>
       <td><span class="tag ${esc(m.value.kind)}">${esc(m.value.kind)}</span></td>
       <td>${esc(m.value.value)}</td><td>${esc(m.value.unit)}</td><td class="muted">${esc(m.value.raw_text)}</td>
       <td><button class="ghost" data-trace='${esc(JSON.stringify({ snapshot_run: runId, page_id: m.provenance.page_id }))}'>溯源</button></td>

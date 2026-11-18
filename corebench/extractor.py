@@ -245,7 +245,8 @@ def _find_col(header_paths: Sequence[Sequence[str]], labels: Sequence[str]) -> O
 
 
 def _extract_long_table(table: Table, header_paths, spec, rule, provenance_base, result) -> None:
-    sample_col = _find_col(header_paths, spec.fields["sample_id"].labels)
+    sample_field = rule.sample_identity_field(spec.key)
+    sample_col = _find_col(header_paths, spec.fields[sample_field].labels)
     analyte_col = _find_col(header_paths, rule.long_format.analyte_labels)
     method_col = _find_col(header_paths, rule.long_format.method_labels)
     value_col = _find_col(header_paths, rule.long_format.value_labels)
@@ -281,12 +282,16 @@ def _extract_long_table(table: Table, header_paths, spec, rule, provenance_base,
                                             result.page_id, table=spec.key, raw=analyte_text))
             continue
         parsed = parse_value(value_text, dimension="concentration", unit_hint=inline_unit)
+        # The identity token stays the stable legacy spelling while the field
+        # keeps its historical name; a renamed identity field (e.g. sample_id
+        # -> sample_code) renames the token as well, and the diff bridges both.
+        identity_token = "sample" if sample_field == "sample_id" else sample_field
         result.measurements.append({
-            "sample_id": sample_id,
+            sample_field: sample_id,
             "analyte": analyte.code,
             "method": method,
             "value": parsed.to_dict(),
-            "identity": f"sample={sample_id}|analyte={analyte.code}|method={method}",
+            "identity": f"{identity_token}={sample_id}|analyte={analyte.code}|method={method}",
             "header": " / ".join(header_paths[value_col]),
             "provenance": {
                 **provenance_base,
@@ -322,22 +327,28 @@ def _method_from_path(path: Sequence[str], analyte, rule: "Rule") -> Optional[st
 
 def _collect_measurements(cells, analyte_by_col, header_paths, record,
                           provenance_base, raw_row, spec, result, rule) -> None:
+    sample_field = rule.sample_identity_field(spec.key)
     sample_id = None
-    for field_name, value in record["fields"].items():
-        if "sample" in field_name.lower():
-            sample_id = value.get("value")
-            break
+    if sample_field in record.get("fields", {}):
+        sample_id = record["fields"][sample_field].get("value")
+    if sample_id is None:
+        # Tolerate legacy rules where the identity column keeps an older name.
+        for field_name, value in record["fields"].items():
+            if "sample" in field_name.lower():
+                sample_id = value.get("value")
+                break
     for col, (analyte, header_unit, path) in analyte_by_col.items():
         cell = cells[col]
         text = cell.clean if cell else ""
         parsed = parse_value(text, dimension="concentration", unit_hint=header_unit)
         method = _method_from_path(path, analyte, rule)
+        identity_token = "sample" if sample_field == "sample_id" else sample_field
         measurement = {
-            "sample_id": sample_id,
+            sample_field: sample_id,
             "analyte": analyte.code,
             "method": method,
             "value": parsed.to_dict(),
-            "identity": f"sample={sample_id}|analyte={analyte.code}|method={method}",
+            "identity": f"{identity_token}={sample_id}|analyte={analyte.code}|method={method}",
             "header": " / ".join(path),
             "provenance": {
                 **provenance_base,
