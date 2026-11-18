@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 
 from .diff import confirm_baseline, regression_report
+from .review import ReviewReuseError, carry_review, create_review
 from .runner import RunConfig, RunEngine
 from .rules import Rule
 from .sources import SnapshotStore
@@ -70,6 +71,29 @@ class WorkbenchApp:
         snapshot = self.snapshots.load(run["snapshot_id"])
         return confirm_baseline(self.store, run, snapshot, payload.get("note", ""))
 
+    # ---------------------------------------------------------------- reviews
+    def create_review(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        review, reviewed_run = create_review(
+            self.store,
+            run_id=payload["run_id"],
+            decisions=payload.get("decisions", []),
+            reviewer=payload.get("reviewer", ""),
+            note=payload.get("note", ""),
+        )
+        return {"review": review, "reviewed_run": reviewed_run}
+
+    def list_reviews(self) -> Dict[str, Any]:
+        return {"reviews": self.store.list_reviews()}
+
+    def get_review(self, review_id: str) -> Dict[str, Any]:
+        return self.store.load_review(review_id)
+
+    def carry_review(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        review = self.store.load_review(payload["review_id"])
+        candidate = self.store.load_run(payload["candidate_run_id"])
+        carried, reviewed_run = carry_review(self.store, review, candidate)
+        return {"review": carried, "reviewed_run": reviewed_run}
+
     def diff(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         baseline = self.store.get_baseline(payload["baseline_id"])
         candidate = self.store.load_run(payload["candidate_run_id"])
@@ -123,6 +147,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         if path == "/api/reports":
             self._json({"reports": self.app.store.list_reports()})
             return
+        if path == "/api/reviews":
+            self._json(self.app.list_reviews())
+            return
+        if path == "/api/review":
+            self._json(self.app.get_review(query["id"][0]))
+            return
         if path == "/api/report":
             report_id = query.get("id", [""])[0]
             with open(os.path.join(self.app.store.reports_dir, f"{report_id}.json"), encoding="utf-8") as fh:
@@ -168,8 +198,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._json(self.app.confirm(payload))
             elif self.path == "/api/diff":
                 self._json(self.app.diff(payload))
+            elif self.path == "/api/reviews/create":
+                self._json(self.app.create_review(payload))
+            elif self.path == "/api/reviews/carry":
+                self._json(self.app.carry_review(payload))
             else:
                 self._error(404, "unknown endpoint")
+        except ReviewReuseError as exc:
+            # The caller needs the structured evaluation to show which
+            # conflicts must be re-reviewed in the regression report.
+            self._json({"error": str(exc), "review_evaluation": exc.evaluation}, status=409)
         except FileNotFoundError as exc:
             self._error(404, str(exc))
         except (ValueError, KeyError) as exc:

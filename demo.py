@@ -7,6 +7,10 @@ It starts the in-process mock drill-archive site, then walks the whole story:
 2. run a collection over HTTP, including a simulated mid-crawl failure and
    checkpoint resume;
 3. show cross-page complementary measurements and the blocking conflict;
+3b. manually adjudicate the conflict (pick a candidate + reason), producing an
+    independent reviewed run and a review-backed baseline;
+3c. replay the same frozen snapshot: an adjudication carries over only when
+    candidate values and sources match; a vanished conflict still fails;
 4. confirm a clean baseline, replay on the frozen snapshot and produce an
    empty semantic diff;
 5. demonstrate a value-change regression and an unexplained-column failure;
@@ -28,6 +32,7 @@ sys.path.insert(0, ROOT)
 from corebench import mock_site  # noqa: E402
 from corebench.diff import compare_runs, confirm_baseline, regression_report  # noqa: E402
 from corebench.merge import read_jsonl  # noqa: E402
+from corebench.review import ReviewReuseError, carry_review, create_review  # noqa: E402
 from corebench.runner import RunConfig, RunEngine  # noqa: E402
 from corebench.rules import Rule  # noqa: E402
 from corebench.sources import SnapshotStore  # noqa: E402
@@ -104,6 +109,70 @@ def main() -> int:
     except ValueError as exc:
         print(f"  基线确认被阻止 -> {exc}")
 
+    # --------------------------------------------- 3b. manual adjudication --
+    hr("3b. 人工裁决：审核员对照候选值与原页，选值并填写理由")
+    conflict = zk01["conflicts"][0]
+    decision = [{
+        "borehole_id": "ZK01",
+        "identity": conflict["identity"],
+        "field": conflict["field"],
+        "conflict_index": 0,
+        "selected_index": 1,  # 0.012 from zk01-p2 (re-test result)
+        "reason": "zk01-p2 为实验室复测，以复测值 0.012 为准",
+    }]
+    review, reviewed_run = create_review(store, "crawl", decision, reviewer="审核员A")
+    print(f"  复核记录: {review['review_id']}（状态 {review['status']}），独立复核运行: "
+          f"{reviewed_run['run_id']}")
+    reviewed_rows = read_jsonl(reviewed_run["output_path"])
+    reviewed_zk01 = next(d for d in reviewed_rows if d["borehole_id"] == "ZK01")
+    chosen = next(m for m in reviewed_zk01["measurements"]
+                  if m["identity"] == conflict["identity"])
+    print(f"  复核结果采用候选值: {chosen['value']['value']} {chosen['value']['unit']}，"
+          f"来源页 {chosen['provenance']['page_id']}；剩余冲突 "
+          f"{len(reviewed_zk01['conflicts'])}")
+    original_rows = read_jsonl(run["output_path"])
+    print(f"  原运行保留且未改动: 仍有冲突 "
+          f"{sum(len(d['conflicts']) for d in original_rows)} 个，输出文件未被覆盖")
+    snapshot = snapshots.load(run["snapshot_id"])
+    adjudicated_baseline = confirm_baseline(store, reviewed_run, snapshot, "人工裁决后的 ZK01 基线")
+    print(f"  复核结果已确认基线: {adjudicated_baseline['baseline_id']} "
+          f"(review_id={adjudicated_baseline['review_id']})")
+
+    hr("3c. 同快照回放：候选值与来源一致才沿用裁决，否则回归不通过")
+    replay = engine.replay("crawl", rule_text=v1["text"], new_run_id="crawl-replay")
+    report = regression_report(store, adjudicated_baseline, replay)
+    reuse = report["review_reuse"]
+    print(f"  同规则回放: 可沿用 {reuse['reusable_count']} 项，需复核 "
+          f"{reuse['needs_recheck_count']} 项；回归通过: {report['regression_passed']}")
+    carried, carried_run = carry_review(store, review, replay)
+    print(f"  裁决沿用 -> 新复核 {carried['review_id']}，复核运行 "
+          f"{carried_run['run_id']}（无剩余冲突: {not carried_run['has_conflicts']}）")
+
+    # Simulate a replay in which the conflict collapsed to only the selected
+    # value: even that must force a re-review and fail the regression.
+    vanished_rows = json.loads(json.dumps(read_jsonl(replay["output_path"])))
+    for doc in vanished_rows:
+        doc["conflicts"] = []
+        for measurement in doc.get("measurements", []):
+            if measurement["identity"] == conflict["identity"]:
+                measurement["value"] = {"kind": "number", "value": 0.012,
+                                        "unit": "mg/kg", "raw_text": "0.012"}
+    vanished_path = store.run_output_path("crawl-replay-vanished")
+    with open(vanished_path, "w", encoding="utf-8") as handle:
+        for doc in vanished_rows:
+            handle.write(json.dumps(doc, ensure_ascii=False, sort_keys=True) + "\n")
+    vanished_run = dict(replay)
+    vanished_run.update(run_id="crawl-replay-vanished", output_path=vanished_path,
+                        has_conflicts=False)
+    store.save_run(vanished_run)
+    vanished_report = regression_report(store, adjudicated_baseline, vanished_run)
+    print(f"  冲突消失（仅剩原选中值）: 回归通过 {vanished_report['regression_passed']}；"
+          f"提示 -> {vanished_report['review_reuse']['items'][0]['detail']}")
+    try:
+        carry_review(store, review, vanished_run)
+    except ReviewReuseError as exc:
+        print(f"  沿用裁决被拒绝（HTTP API 会返回 409）: {exc}")
+
     # ------------------------------------------------- 4. clean baseline + diff
     hr("4. 干净钻孔 ZK02：确认基线，并在同一快照上回放（空差异）")
     zk02_manifest = [page for page in manifest if "zk02" in page["page_id"]]
@@ -136,6 +205,7 @@ def main() -> int:
     hr("6. 产物清单")
     print(f"  JSON Lines 输出:   {run['output_path']}")
     print(f"  快照目录:          {snapshots.root}")
+    print(f"  人工复核目录:      {store.reviews_dir}")
     print(f"  基线目录:          {store.baselines_dir}")
     print(f"  差异报告目录:      {store.reports_dir}")
     server.shutdown()

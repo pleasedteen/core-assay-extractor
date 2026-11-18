@@ -81,7 +81,8 @@ async function loadRuns() {
   const { runs } = await api("/api/runs");
   const tbody = $("runs-table").querySelector("tbody");
   tbody.innerHTML = runs.map((r) => `<tr>
-    <td><code>${esc(r.run_id)}</code></td><td>${esc(r.rule_id)}</td>
+    <td><code>${esc(r.run_id)}</code>${r.kind === "reviewed" ? '<span class="tag conflict">复核结果</span>' : ""}</td>
+    <td>${esc(r.rule_id)}</td>
     <td><span class="tag ${esc(r.status)}">${esc(r.status)}</span></td>
     <td>${r.has_conflicts ? '<span class="tag conflict">有冲突</span>' : "无"}</td>
     <td>${r.has_warnings ? "有" : "无"}</td>
@@ -125,22 +126,96 @@ $("btn-start").addEventListener("click", async () => {
 $("btn-refresh-runs").addEventListener("click", refreshAll);
 
 async function showOutput(runId) {
-  const { lines } = await api(`/api/output?run_id=${encodeURIComponent(runId)}`);
-  const html = lines.map((doc) => {
-    const conflicts = (doc.conflicts || []).map((c) => `<li class="diff-chg">冲突 ${esc(c.identity)} · ${esc(c.field)}: ${esc(JSON.stringify(c.values))}</li>`).join("");
+  const [{ lines }, { reviews }] = await Promise.all([
+    api(`/api/output?run_id=${encodeURIComponent(runId)}`),
+    api("/api/reviews"),
+  ]);
+  const runReviews = reviews.filter((rv) => rv.source_run_id === runId);
+  const reviewBanner = runReviews.length ? runReviews.map((rv) =>
+    `<p class="diff-add">已有复核 <code>${esc(rv.review_id)}</code> · 状态 ${esc(rv.status)} · 未解决 ${rv.unresolved.length} 项</p>`).join("") : "";
+  const html = lines.map((doc, docIndex) => {
+    const conflicts = (doc.conflicts || []).map((c, conflictIndex) => renderConflictCard(runId, doc, c, conflictIndex)).join("");
+    const adjudications = (doc.adjudications || []).map((a) =>
+      `<li class="diff-add">已裁决 ${esc(a.identity)} · 采用候选 #${a.selected_index} · 理由：${esc(a.reason)}</li>`).join("");
     const meas = (doc.measurements || []).map((m) => `<tr>
       <td>${esc(m.sample_id)}</td><td>${esc(m.analyte)}</td><td>${esc(m.method)}</td>
       <td><span class="tag ${esc(m.value.kind)}">${esc(m.value.kind)}</span></td>
       <td>${esc(m.value.value)}</td><td>${esc(m.value.unit)}</td><td class="muted">${esc(m.value.raw_text)}</td>
-      <td><button class="ghost" data-trace='${esc(JSON.stringify({ snapshot_run: runId, page_id: m.provenance.page_id }))}'>溯源</button></td>
+      <td><button class="ghost" data-trace='${esc(JSON.stringify({ snapshot_run: runId, page_id: m.provenance.page_id }))}'>溯源</button>
+      ${m.adjudication ? '<span class="tag conflict">人工裁决</span>' : ""}</td>
     </tr>`).join("");
-    return `<details open><summary>钻孔 ${esc(doc.borehole_id)} · 区间 ${doc.intervals.length} · 样品 ${doc.samples.length} · 测量 ${doc.measurements.length} · 页 ${esc((doc.source_pages || []).join(", "))}</summary>
-      ${conflicts ? `<ul>${conflicts}</ul>` : ""}
+    return `<details open><summary>钻孔 ${esc(doc.borehole_id)} · 区间 ${doc.intervals.length} · 样品 ${doc.samples.length} · 测量 ${doc.measurements.length} · 冲突 ${(doc.conflicts || []).length} · 页 ${esc((doc.source_pages || []).join(", "))}</summary>
+      ${reviewBanner}
+      ${adjudications ? `<ul>${adjudications}</ul>` : ""}
+      ${conflicts}
       <table class="grid"><thead><tr><th>样品</th><th>项目</th><th>方法</th><th>类型</th><th>归一值</th><th>单位</th><th>原文</th><th></th></tr></thead><tbody>${meas}</tbody></table>
     </details>`;
   }).join("");
   $("run-output").innerHTML = html || "<p class='muted'>尚无输出（运行可能未完成）。</p>";
-  $("run-output").querySelectorAll("[data-trace]").forEach((b) => b.addEventListener("click", () => showSourcePage(runId, JSON.parse(b.dataset.trace).page_id)));
+  $("run-output").querySelectorAll("[data-trace]").forEach((b) => b.addEventListener("click", () => {
+    const payload = JSON.parse(b.dataset.trace);
+    if (payload.page_id) showSourcePage(runId, payload.page_id);
+  }));
+  bindReviewForms(runId);
+}
+
+function renderConflictCard(runId, doc, conflict, conflictIndex) {
+  const candidates = conflict.values.map((v, index) => {
+    const src = conflict.sources[index] || {};
+    return `<tr class="${index === 0 ? "" : ""}">
+      <td><label><input type="radio" name="pick-${esc(doc.borehole_id)}-${conflictIndex}" value="${index}"> 候选 #${index}</label></td>
+      <td><span class="tag ${esc(v.kind)}">${esc(v.kind)}</span></td>
+      <td>${esc(v.value)}</td><td>${esc(v.unit)}</td><td class="muted">${esc(v.raw_text)}</td>
+      <td class="muted">${esc(src.page_id || "")} ${esc(src.table || "")} sha1 <code>${esc((src.content_sha1 || "").slice(0, 10))}</code>
+        <br>${esc((src.raw_row || []).join(" | "))}${src.raw_cell ? " | cell=" + esc(src.raw_cell) : ""}
+        <br><button class="ghost" data-trace='${esc(JSON.stringify({ page_id: src.page_id }))}'>查看原页</button></td>
+    </tr>`;
+  }).join("");
+  const formId = `review-form-${esc(doc.borehole_id)}-${conflictIndex}`;
+  return `<div class="review-card">
+    <h4>冲突 · ${esc(conflict.identity)} · 字段 ${esc(conflict.field)}
+      <span class="tag conflict">待人工裁决</span></h4>
+    <p class="muted">对照各候选值与原页来源，选择一项并填写理由；提交后生成独立复核结果，原运行保留不变。</p>
+    <table class="grid"><thead><tr><th>选择</th><th>类型</th><th>归一值</th><th>单位</th><th>原文</th><th>来源（原页 / 原始内容）</th></tr></thead>
+      <tbody>${candidates}</tbody></table>
+    <form id="${formId}" class="review-form" data-run='${esc(JSON.stringify({
+      run_id: runId, borehole_id: doc.borehole_id, identity: conflict.identity,
+      field: conflict.field, conflict_index: conflictIndex,
+    }))}'>
+      <div class="row">
+        <label>审核员 <input type="text" name="reviewer" placeholder="工号/姓名"></label>
+        <label>裁决理由 <input type="text" name="reason" placeholder="必填，例如：以 p2 复测值为准" style="min-width:320px"></label>
+        <button class="primary" type="submit">提交复核</button>
+      </div>
+    </form>
+  </div>`;
+}
+
+function bindReviewForms(runId) {
+  $("run-output").querySelectorAll(".review-form").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const meta = JSON.parse(form.dataset.run);
+      const picked = form.querySelector(`input[name="pick-${esc(meta.borehole_id)}-${meta.conflict_index}"]:checked`);
+      if (!picked) return toast("请先选择一个候选值");
+      if (!form.elements.reason.value.trim()) return toast("请填写裁决理由");
+      try {
+        const result = await api("/api/reviews/create", {
+          run_id: meta.run_id,
+          reviewer: form.elements.reviewer.value.trim(),
+          note: "",
+          decisions: [{
+            borehole_id: meta.borehole_id, identity: meta.identity, field: meta.field,
+            conflict_index: meta.conflict_index, selected_index: Number(picked.value),
+            reason: form.elements.reason.value.trim(),
+          }],
+        });
+        toast(`复核已生成：${result.review.review_id}；复核运行 ${result.reviewed_run.run_id}`);
+        await refreshAll();
+        showOutput(meta.run_id);
+      } catch (exc) { toast("复核提交失败：" + exc.message); }
+    });
+  });
 }
 
 async function showProvenance(runId) {
@@ -166,6 +241,7 @@ async function loadBaselines(selectId) {
   const tbody = $("baselines-table").querySelector("tbody");
   tbody.innerHTML = baselines.map((b) => `<tr>
     <td><code>${esc(b.baseline_id)}</code></td><td>${esc(b.run_id)}</td><td>${esc(b.rule_id)}</td>
+    <td>${b.review_id ? `<code>${esc(b.review_id)}</code>` : "—"}</td>
     <td><code>${esc(b.snapshot_id)}</code></td><td>${esc(b.confirmed_at)}</td><td>${esc(b.note)}</td></tr>`).join("");
   const sel = $("diff-baseline");
   if (sel) sel.innerHTML = baselines.map((b) => `<option>${esc(b.baseline_id)}</option>`).join("");
@@ -184,17 +260,24 @@ $("btn-diff").addEventListener("click", async () => {
 
 function renderDiff(report) {
   const passed = report.regression_passed;
+  const reuse = report.review_reuse;
+  const reuseBanner = reuse ? `<p>人工裁决沿用：可沿用 <b class="diff-add">${reuse.reusable_count}</b> 项 ·
+    需复核 <b class="diff-del">${reuse.needs_recheck_count}</b> 项
+    （候选值与来源完全一致才可沿用；冲突消失即使只剩原选中值也判未通过）</p>` : "";
   $("diff-summary").innerHTML = `回归结论：<b class="${passed ? "diff-add" : "diff-del"}">${passed ? "通过" : "未通过"}</b>
-    · 统计 ${esc(JSON.stringify(report.summary))} · 快照完整：${report.snapshot_complete ? "是" : '<span class="diff-del">否</span>'}`;
+    · 统计 ${esc(JSON.stringify(report.summary))} · 快照完整：${report.snapshot_complete ? "是" : '<span class="diff-del">否</span>'}${reuseBanner}`;
   const rows = report.changes.map((ch) => {
     const fields = ch.field_changes.map((fc) => {
       const src = fc.new_source || fc.old_source || ch.new_source || ch.old_source || {};
-      return `<tr><td>${esc(fc.field)}</td><td><span class="tag ${fc.category === "value_changed" ? "conflict" : "censored"}">${esc(fc.category)}</span></td>
+      const tagClass = fc.category === "review_recheck_required" ? "conflict"
+        : fc.category === "value_changed" ? "conflict" : "censored";
+      return `<tr><td>${esc(fc.field)}</td><td><span class="tag ${tagClass}">${esc(fc.category)}</span></td>
         <td class="diff-del">${esc(JSON.stringify(fc.old))}</td><td class="diff-add">${esc(JSON.stringify(fc.new))}</td>
         <td>${esc(fc.detail || "")}</td>
         <td class="muted">${esc(src.page_id || "")} ${esc(src.table || "")} ${esc((src.raw_row || []).join(" | "))}${src.raw_cell ? " | cell=" + esc(src.raw_cell) : ""}</td></tr>`;
     }).join("");
-    return `<details><summary><span class="diff-chg">${esc(ch.category)}</span> · ${esc(ch.record_type)} · <code>${esc(ch.identity)}</code></summary>
+    const carried = ch.adjudication_carried ? ' <span class="tag conflict">裁决可沿用</span>' : "";
+    return `<details ${ch.category === "review_recheck_required" ? "open" : ""}><summary><span class="diff-chg">${esc(ch.category)}</span> · ${esc(ch.record_type)} · <code>${esc(ch.identity)}</code>${carried}</summary>
       <table class="grid"><thead><tr><th>字段</th><th>类别</th><th>旧值</th><th>新值</th><th>说明</th><th>对应原页 / 原始内容</th></tr></thead><tbody>${fields}</tbody></table></details>`;
   }).join("");
   $("diff-results").innerHTML = rows || "<p class='diff-add'>无业务数据变化（字段改名、列表换序、等价单位均已忽略）。</p>";

@@ -129,6 +129,98 @@ class WebApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(fetched["report_id"], report["report_id"])
 
+    def test_07_conflict_review_endpoint_and_replay_guard(self):
+        # web-run contains the ZK01 conflict and cannot itself be confirmed.
+        decision = {
+            "borehole_id": "ZK01",
+            "identity": "sample=S102|analyte=Au|method=FA",
+            "field": "value", "conflict_index": 0,
+            "selected_index": 1, "reason": "p2 复测为准", "reviewer": "bob",
+        }
+        # Missing reason is rejected with 400.
+        bad = dict(decision)
+        bad["reason"] = ""
+        status, payload = post(self.base, "/api/reviews/create",
+                               {"run_id": "web-run", "decisions": [bad]})
+        self.assertEqual(status, 400)
+        self.assertIn("error", payload)
+
+        status, payload = post(self.base, "/api/reviews/create",
+                               {"run_id": "web-run", "decisions": [decision]})
+        self.assertEqual(status, 200)
+        review_id = payload["review"]["review_id"]
+        reviewed_run_id = payload["reviewed_run"]["run_id"]
+        self.assertFalse(payload["reviewed_run"]["has_conflicts"])
+
+        # Reviews are listed and individually retrievable.
+        status, listing = get_json(self.base, "/api/reviews")
+        self.assertEqual(status, 200)
+        self.assertIn(review_id, {item["review_id"] for item in listing["reviews"]})
+        status, fetched = get_json(self.base, f"/api/review?id={review_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(fetched["decisions"][0]["candidates"][1]["source"]["page_id"],
+                         "zk01-p2")
+
+        # The independent reviewed run can be confirmed as a baseline.
+        status, baseline = post(self.base, "/api/baselines/confirm",
+                                {"run_id": reviewed_run_id, "note": "adjudicated"})
+        self.assertEqual(status, 200)
+        self.assertEqual(baseline["review_id"], review_id)
+
+        # Replay on the same frozen snapshot keeps identical candidates:
+        # the adjudication carries over and the regression passes.
+        _, rules = get_json(self.base, "/api/rules")
+        rule_id = rules["rules"][0]["rule_id"]
+        status, replay = post(self.base, "/api/runs/replay",
+                              {"run_id": "web-run", "candidate_rule_id": rule_id,
+                               "new_run_id": "web-run-replay"})
+        self.assertEqual(status, 200)
+        status, report = post(self.base, "/api/diff",
+                              {"baseline_id": baseline["baseline_id"],
+                               "candidate_run_id": "web-run-replay"})
+        self.assertEqual(status, 200)
+        self.assertTrue(report["regression_passed"])
+        self.assertEqual(report["review_reuse"]["needs_recheck_count"], 0)
+
+        # Explicit carry endpoint produces a second independent reviewed run.
+        status, carry_payload = post(self.base, "/api/reviews/carry", {
+            "review_id": review_id, "candidate_run_id": "web-run-replay"})
+        self.assertEqual(status, 200)
+        self.assertEqual(carry_payload["review"]["carried_from_review_id"], review_id)
+        self.assertFalse(carry_payload["reviewed_run"]["has_conflicts"])
+
+        # A replay whose candidate value no longer matches must be refused with
+        # HTTP 409, carrying the structured re-check evaluation.
+        import json as _json
+        import os as _os
+        _, run_detail = get_json(self.base, "/api/run?id=web-run-replay")
+        output_path = run_detail["output_path"]
+        with open(output_path, encoding="utf-8") as handle:
+            broken_rows = [_json.loads(line) for line in handle if line.strip()]
+        for row in broken_rows:
+            for conflict in row.get("conflicts", []):
+                conflict["values"][1]["value"] = 0.777
+        broken_id = "web-run-replay-broken"
+        broken_path = _os.path.join(_os.path.dirname(output_path), "..",
+                                    broken_id, "output.jsonl")
+        broken_path = _os.path.normpath(broken_path)
+        _os.makedirs(_os.path.dirname(broken_path), exist_ok=True)
+        with open(broken_path, "w", encoding="utf-8") as handle:
+            for row in broken_rows:
+                handle.write(_json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        broken_run = dict(run_detail)
+        broken_run["run_id"] = broken_id
+        broken_run["output_path"] = broken_path
+        broken_run["note"] = "tampered replay for re-check"
+        with open(_os.path.join(_os.path.dirname(broken_path), "run.json"),
+                  "w", encoding="utf-8") as handle:
+            _json.dump(broken_run, handle, ensure_ascii=False)
+        status, refused = post(self.base, "/api/reviews/carry",
+                               {"review_id": review_id, "candidate_run_id": broken_id})
+        self.assertEqual(status, 409)
+        self.assertIn("review_evaluation", refused)
+        self.assertEqual(refused["review_evaluation"]["needs_recheck_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

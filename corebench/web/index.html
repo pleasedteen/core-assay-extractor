@@ -49,6 +49,9 @@ pre.raw { background:#0f1722; color:#d8e2ee; padding:12px; border-radius:6px; ov
 details { margin-top:8px; }
 summary { cursor:pointer; font-weight:600; font-size:13px; }
 code { background:#eef2f7; padding:1px 5px; border-radius:4px; }
+.review-card { border:1px solid var(--err); border-radius:8px; padding:12px 14px; margin:10px 0; background:#fff8f7; }
+.review-card h4 { margin:0 0 8px; font-size:13.5px; }
+.review-form { margin-top:10px; }
 </style>
 </head>
 <body>
@@ -123,18 +126,18 @@ code { background:#eef2f7; padding:1px 5px; border-radius:4px; }
   <!-- ========================= baselines ========================= -->
   <section id="panel-baselines" class="panel">
     <div class="card">
-      <h2>确认基线（仅完整、无冲突的成功回放可确认）</h2>
+      <h2>确认基线（完整、无未解决冲突的成功运行或复核结果可确认）</h2>
       <div class="row">
         <label>运行 ID <select id="baseline-run"></select></label>
         <label>说明 <input type="text" id="baseline-note"></label>
         <button class="primary" id="btn-confirm-baseline">确认为基线</button>
       </div>
-      <p class="muted">存在矛盾测量、快照不完整或运行未完成时，确认会被阻止。</p>
+      <p class="muted">存在未裁决矛盾测量、快照不完整或运行未完成时，确认会被阻止；人工复核结果在全部冲突裁决后可确认，复核运行与原运行相互独立。</p>
     </div>
     <div class="card">
       <h2>已确认基线</h2>
       <table class="grid" id="baselines-table"><thead><tr>
-        <th>基线 ID</th><th>来源运行</th><th>规则</th><th>快照</th><th>确认时间</th><th>说明</th>
+        <th>基线 ID</th><th>来源运行</th><th>规则</th><th>人工复核</th><th>快照</th><th>确认时间</th><th>说明</th>
       </tr></thead><tbody></tbody></table>
     </div>
   </section>

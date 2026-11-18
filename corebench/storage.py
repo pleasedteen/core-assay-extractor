@@ -33,8 +33,9 @@ class WorkbenchStore:
         self.snapshots_dir = os.path.join(self.root, "snapshots")
         self.baselines_dir = os.path.join(self.root, "baselines")
         self.reports_dir = os.path.join(self.root, "reports")
+        self.reviews_dir = os.path.join(self.root, "reviews")
         for directory in (self.rules_dir, self.runs_dir, self.snapshots_dir,
-                          self.baselines_dir, self.reports_dir):
+                          self.baselines_dir, self.reports_dir, self.reviews_dir):
             os.makedirs(directory, exist_ok=True)
 
     # ------------------------------------------------------------- rules ----
@@ -114,3 +115,27 @@ class WorkbenchStore:
 
     def list_reports(self) -> List[str]:
         return sorted(f[:-5] for f in os.listdir(self.reports_dir) if f.endswith(".json"))
+
+    # ------------------------------------------------------------ reviews ----
+    def review_path(self, review_id: str) -> str:
+        return os.path.join(self.reviews_dir, f"{review_id}.json")
+
+    def save_review(self, review: Dict[str, Any]) -> None:
+        _atomic_write_json(self.review_path(review["review_id"]), review)
+
+    def load_review(self, review_id: str) -> Dict[str, Any]:
+        return _read_json(self.review_path(review_id))
+
+    def list_reviews(self) -> List[Dict[str, Any]]:
+        if not os.path.isdir(self.reviews_dir):
+            return []
+        items = []
+        for filename in sorted(os.listdir(self.reviews_dir)):
+            if filename.endswith(".json"):
+                items.append(_read_json(os.path.join(self.reviews_dir, filename)))
+        items.sort(key=lambda item: item.get("created_at", ""))
+        return items
+
+    def reviews_for_run(self, run_id: str) -> List[Dict[str, Any]]:
+        return [item for item in self.list_reviews()
+                if item.get("source_run_id") == run_id or item.get("carried_from_run_id") == run_id]
