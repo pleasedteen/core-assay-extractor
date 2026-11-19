@@ -288,5 +288,211 @@ class DiffSemanticsTest(unittest.TestCase):
                 regression_report(store, baseline, run_a)
 
 
+class GapAttributionTest(unittest.TestCase):
+    """Same-snapshot replays of two rule versions on multi-page archives.
+
+    These exercise the reported defects end to end: a new rule that no longer
+    recognises an old column must produce *one* attributed gap (not a deletion
+    plus an unexplained field), legitimate removals keep their ``removed``
+    category, and a missing critical table blocks baseline/regression.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp()
+        cls.store = WorkbenchStore(cls.tmp)
+        cls.snapshots = SnapshotStore(os.path.join(cls.tmp, "snapshots"))
+        cls.store.snapshots = cls.snapshots
+        cls.manifest = None
+        cls.server, cls.base_url = mock_site.start_mock_server()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def setUp(self):
+        self.engine = RunEngine(self.store, self.snapshots)
+        self.manifest = [
+            {"page_id": page["page_id"],
+             "url": f"{self.base_url}/site/{borehole}/{page['page_id']}"}
+            for borehole, pages in mock_site.DATASET.items() for page in pages
+        ]
+
+    def _start(self, run_id, rule):
+        self.engine.start(RunConfig(run_id, rule["rule_id"], rule["text"], self.manifest))
+        return self.engine.run(run_id)
+
+    def test_dropped_column_counts_once_per_affected_page(self):
+        rule_v1 = self.store.save_rule_version("drill-archive", rule_text(1), "v1")
+        base = self._start(f"gap-base-{id(self)}", rule_v1)
+        old_rows = read_jsonl(base["output_path"])
+
+        # Candidate rule forgets the Zn analyte entirely: both Zn columns on
+        # zk01-p1 and the Zn column on zk01-p2 become uninterpretable, while
+        # every other analyte is still extracted.
+        candidate = rule_text(1).replace("  - code: Zn\n    labels: [Zn]\n", "")
+        replay = self.engine.replay(base["run_id"], rule_text=candidate,
+                                    new_run_id=f"gap-cand-{id(self)}")
+        new_rows = read_jsonl(replay["output_path"])
+        report = compare_runs(old_rows, new_rows)
+
+        # One gap per affected original page/column; nothing reported as a
+        # plain deletion, and no duplicate unexplained entries.
+        self.assertEqual(report["summary"].get("removed", 0), 0, report["summary"])
+        gap_changes = [c for c in report["changes"] if c["record_type"] == "gap"]
+        self.assertEqual(len(gap_changes), 2, gap_changes)
+        self.assertEqual({c["new_source"]["page_id"] for c in gap_changes},
+                         {"zk01-p1", "zk01-p2"})
+        self.assertEqual({c["category"] for c in gap_changes}, {"unexplained_field"})
+        self.assertTrue(all("zn" in c["identity"].lower() for c in gap_changes))
+        # The two measurements that vanished from zk01-p1 are attached to that
+        # page's single gap, not double counted.
+        p1_gap = next(c for c in gap_changes if c["new_source"]["page_id"] == "zk01-p1")
+        self.assertEqual(
+            {a["identity"] for a in p1_gap["affected"]},
+            {"measurement::sample=S101|analyte=Zn|method=ICP-AES",
+             "measurement::sample=S102|analyte=Zn|method=ICP-AES"},
+        )
+        # Regression must fail because an old field became uninterpretable.
+        self.assertFalse(report["regression_passed"])
+
+    def test_gap_attribution_keeps_other_pages_and_missing_values(self):
+        rule_v1 = self.store.save_rule_version("drill-archive", rule_text(1), "v1")
+        base = self._start(f"gap2-base-{id(self)}", rule_v1)
+        old_rows = read_jsonl(base["output_path"])
+
+        # Only the long-format page (zk01-p3) loses its value column; the wide
+        # pages keep extracting and their legitimate missing cells stay intact.
+        candidate = rule_text(1).replace("    value_column: [结果]", "    value_column: [结果值未识别]")
+        replay = self.engine.replay(base["run_id"], rule_text=candidate,
+                                    new_run_id=f"gap2-cand-{id(self)}")
+        new_rows = read_jsonl(replay["output_path"])
+        report = compare_runs(old_rows, new_rows)
+
+        gap_changes = [c for c in report["changes"] if c["record_type"] == "gap"]
+        self.assertEqual(len(gap_changes), 1, report["changes"])
+        self.assertEqual(gap_changes[0]["new_source"]["page_id"], "zk01-p3")
+        # The S103 measurements on that page are attributed to the single gap.
+        self.assertEqual(len(gap_changes[0]["affected"]), 3)
+        # Everything extracted on the other pages is unchanged, including the
+        # deliberate empty (missing) cells on zk01-p1.
+        self.assertFalse([c for c in report["changes"]
+                          if c["record_type"] != "gap" and c["category"] != "added"])
+        self.assertEqual(report["summary"].get("removed", 0), 0)
+
+    def test_legitimate_deletion_is_still_removed(self):
+        rule_v1 = self.store.save_rule_version("drill-archive", rule_text(1), "v1")
+        base = self._start(f"del-base-{id(self)}", rule_v1)
+        old_rows = read_jsonl(base["output_path"])
+        new_rows = json.loads(json.dumps(old_rows))
+        for doc in new_rows:
+            if doc["borehole_id"] == "ZK01":
+                doc["intervals"] = [i for i in doc["intervals"]
+                                    if i["identity"] != "interval_id=I-2"]
+        # No gap warning corresponds to this removal, so it stays ``removed``.
+        report = compare_runs(old_rows, new_rows)
+        self.assertEqual(report["summary"].get("removed", 0), 1)
+        self.assertEqual(report["changes"][0]["category"], "removed")
+
+    def test_gap_on_one_table_does_not_absorb_other_table_records(self):
+        rule_v1 = self.store.save_rule_version("drill-archive", rule_text(1), "v1")
+        base = self._start(f"xtab-base-{id(self)}", rule_v1)
+        old_rows = read_jsonl(base["output_path"])
+        candidate = rule_text(1).replace("selector: table.assay-table",
+                                          "selector: table.assay-absent")
+        replay = self.engine.replay(base["run_id"], rule_text=candidate,
+                                    new_run_id=f"xtab-cand-{id(self)}")
+        new_rows = read_jsonl(replay["output_path"])
+        # Delete one interval as well: the assay gap must not swallow it.
+        for doc in new_rows:
+            if doc["borehole_id"] == "ZK01":
+                doc["intervals"] = [i for i in doc["intervals"]
+                                    if i["identity"] != "interval_id=I-2"]
+        report = compare_runs(old_rows, new_rows)
+        removed = [c for c in report["changes"] if c["category"] == "removed"]
+        self.assertEqual([c["identity"] for c in removed], ["interval::interval_id=I-2"])
+        gaps = [c for c in report["changes"] if c["record_type"] == "gap"]
+        self.assertTrue(gaps)
+        self.assertTrue(all(c["new_source"]["table"] == "assay_table" for c in gaps))
+
+    def test_missing_critical_table_blocks_baseline_and_regression(self):
+        rule_v1 = self.store.save_rule_version("drill-archive", rule_text(1), "v1")
+        zk02 = [page for page in self.manifest if "zk02" in page["page_id"]]
+        self.engine.start(RunConfig(f"crit-base-{id(self)}", rule_v1["rule_id"],
+                                    rule_v1["text"], zk02))
+        base = self.engine.run(f"crit-base-{id(self)}")
+        baseline = confirm_baseline(self.store, base,
+                                    self.snapshots.load(base["snapshot_id"]))
+
+        broken_rule = rule_text(1).replace("selector: table.assay-table",
+                                           "selector: table.assay-gone")
+        replay = self.engine.replay(base["run_id"], rule_text=broken_rule,
+                                    new_run_id=f"crit-cand-{id(self)}")
+        # The run "completes" but the critical assay table is simply absent.
+        self.assertTrue(replay["has_critical_gaps"])
+        with self.assertRaises(ValueError):
+            confirm_baseline(self.store, replay,
+                             self.snapshots.load(replay["snapshot_id"]))
+        report = regression_report(self.store, baseline, replay)
+        self.assertFalse(report["regression_passed"])
+        self.assertEqual({g["table"] for g in report["candidate_critical_gaps"]},
+                         {"assay_table"})
+
+    def test_optional_table_gap_does_not_block_baseline(self):
+        rule_v1 = self.store.save_rule_version("drill-archive", rule_text(1), "v1")
+        zk02 = [page for page in self.manifest if "zk02" in page["page_id"]]
+        optional = (rule_text(1)
+                    .replace("      selector: table.assay-table",
+                             "      selector: table.assay-gone\n      required: false"))
+        self.engine.start(RunConfig(f"opt-{id(self)}", rule_v1["rule_id"],
+                                    optional, zk02))
+        run = self.engine.run(f"opt-{id(self)}")
+        self.assertFalse(run["has_critical_gaps"])
+        # A non-critical gap is still baselineable.
+        confirm_baseline(self.store, run, self.snapshots.load(run["snapshot_id"]))
+
+    def test_unexplained_column_blocks_regression_not_baseline(self):
+        # An extra column the rule cannot interpret is a field-level gap: it is
+        # attributed to its original page/column and is not a critical table
+        # failure, so it blocks regression without implying the table is gone.
+        from corebench.sources import PageContent
+        from corebench.extractor import extract_page
+        from corebench.rules import Rule
+        html = mock_site.render_page("ZK02", mock_site.DATASET["ZK02"][0])
+        # Add a whole new column the rule knows nothing about.
+        html = html.replace('<th colspan="1">Cu</th>',
+                            '<th colspan="1">Cu</th><th colspan="1">Xr</th>')
+        html = html.replace('<th>ICP-AES (mg/kg)</th>',
+                            '<th>ICP-AES (mg/kg)</th><th>新仪器读数 (mg/kg)</th>')
+        html = html.replace('<td>77.0</td>', '<td>77.0</td><td>9.5</td>')
+        page = PageContent.make("zk02-p1", "injected", html)
+        result = extract_page(page, Rule.from_text(rule_text(1)))
+        unexplained = [w for w in result.warnings if w.code == "UNEXPLAINED_COLUMN"]
+        self.assertTrue(unexplained)
+        # It is tied to the original page and column, and is not critical.
+        self.assertEqual(unexplained[0].page_id, "zk02-p1")
+        self.assertEqual(unexplained[0].field, "Xr / 新仪器读数 (mg/kg)")
+        self.assertFalse(unexplained[0].critical)
+        self.assertIsNotNone(unexplained[0].url)
+
+    def test_same_gap_in_baseline_and_candidate_is_not_a_regression(self):
+        rule_v1 = self.store.save_rule_version("drill-archive", rule_text(1), "v1")
+        zk02 = [page for page in self.manifest if "zk02" in page["page_id"]]
+        optional = (rule_text(1)
+                    .replace("      selector: table.assay-table",
+                             "      selector: table.assay-gone\n      required: false"))
+        self.engine.start(RunConfig(f"same-base-{id(self)}", rule_v1["rule_id"],
+                                    optional, zk02))
+        base = self.engine.run(f"same-base-{id(self)}")
+        baseline = confirm_baseline(self.store, base,
+                                    self.snapshots.load(base["snapshot_id"]))
+        replay = self.engine.replay(base["run_id"], rule_text=optional,
+                                    new_run_id=f"same-cand-{id(self)}")
+        report = regression_report(self.store, baseline, replay)
+        # The pre-existing non-critical gap is not reported anew.
+        self.assertTrue(report["regression_passed"], report["changes"])
+        self.assertEqual(report["summary"]["total"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

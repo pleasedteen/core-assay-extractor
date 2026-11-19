@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from .extractor import PageExtraction, extract_page
-from .merge import BoreholeDocument, has_blocking_conflicts, merge_extractions, write_jsonl
+from .diff import critical_gaps
+from .merge import BoreholeDocument, has_blocking_conflicts, merge_extractions, read_jsonl, write_jsonl
 from .rules import Rule
 from .sources import PageContent, Snapshot, SnapshotStore, SourceError, fetch_page
 
@@ -109,6 +110,8 @@ class RunEngine:
             run["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             run["has_conflicts"] = has_blocking_conflicts(documents)
             run["has_warnings"] = any(doc.warnings for doc in documents)
+            run["critical_gaps"] = critical_gaps(read_jsonl(output_path))
+            run["has_critical_gaps"] = bool(run["critical_gaps"])
             run["output_path"] = output_path
             self.store.save_run(run)
             self.snapshot_store.save(snapshot)
@@ -133,6 +136,7 @@ class RunEngine:
         replay_id = new_run_id or f"{run_id}-replay-{int(time.time() * 1000)}"
         output_path = self.store.run_output_path(replay_id)
         write_jsonl(documents, output_path)
+        run_critical_gaps = critical_gaps(read_jsonl(output_path))
         replay_run = {
             "run_id": replay_id,
             "rule_id": original["rule_id"] if rule_text is None else f"{original['rule_id']}:candidate",
@@ -145,6 +149,8 @@ class RunEngine:
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "has_conflicts": has_blocking_conflicts(documents),
             "has_warnings": any(doc.warnings for doc in documents),
+            "critical_gaps": run_critical_gaps,
+            "has_critical_gaps": bool(run_critical_gaps),
             "output_path": output_path,
             "error": None,
             "replayed_from": run_id,

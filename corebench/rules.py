@@ -60,6 +60,11 @@ class TableSpec:
     header_layers: int = 1
     fields: Dict[str, FieldSpec] = field(default_factory=dict)
     identity: List[str] = field(default_factory=list)
+    # A critical table must be extracted on every page that declares it: a
+    # missing selector match / unparseable table / missing required column is a
+    # data-loss gap that blocks baseline confirmation and regression passes.
+    # Rules may opt out per table with ``required: false``.
+    required: bool = True
 
 
 @dataclass
@@ -111,6 +116,7 @@ class Rule:
                 header_layers=int(spec.get("header_layers", 1)),
                 fields=fields,
                 identity=list(spec.get("identity") or []),
+                required=bool(spec.get("required", True)),
             )
         analytes: Dict[str, AnalyteSpec] = {}
         for item in data.get("analytes", []):

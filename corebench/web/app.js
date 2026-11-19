@@ -84,7 +84,7 @@ async function loadRuns() {
     <td><code>${esc(r.run_id)}</code></td><td>${esc(r.rule_id)}</td>
     <td><span class="tag ${esc(r.status)}">${esc(r.status)}</span></td>
     <td>${r.has_conflicts ? '<span class="tag conflict">有冲突</span>' : "无"}</td>
-    <td>${r.has_warnings ? "有" : "无"}</td>
+    <td>${r.has_critical_gaps ? '<span class="tag failed">关键表失败</span>' : (r.has_warnings ? "有" : "无")}</td>
     <td><code>${esc(r.snapshot_id)}</code></td>
     <td>${esc(r.started_at)}</td>
     <td>
@@ -184,8 +184,10 @@ $("btn-diff").addEventListener("click", async () => {
 
 function renderDiff(report) {
   const passed = report.regression_passed;
+  const critical = (report.candidate_critical_gaps || []).length
+    ? ` · <span class="diff-del">关键表失败：${report.candidate_critical_gaps.map((g) => esc(g.identity)).join("、")}</span>` : "";
   $("diff-summary").innerHTML = `回归结论：<b class="${passed ? "diff-add" : "diff-del"}">${passed ? "通过" : "未通过"}</b>
-    · 统计 ${esc(JSON.stringify(report.summary))} · 快照完整：${report.snapshot_complete ? "是" : '<span class="diff-del">否</span>'}`;
+    · 统计 ${esc(JSON.stringify(report.summary))} · 快照完整：${report.snapshot_complete ? "是" : '<span class="diff-del">否</span>'}${critical}`;
   const rows = report.changes.map((ch) => {
     const fields = ch.field_changes.map((fc) => {
       const src = fc.new_source || fc.old_source || ch.new_source || ch.old_source || {};
@@ -194,7 +196,14 @@ function renderDiff(report) {
         <td>${esc(fc.detail || "")}</td>
         <td class="muted">${esc(src.page_id || "")} ${esc(src.table || "")} ${esc((src.raw_row || []).join(" | "))}${src.raw_cell ? " | cell=" + esc(src.raw_cell) : ""}</td></tr>`;
     }).join("");
-    return `<details><summary><span class="diff-chg">${esc(ch.category)}</span> · ${esc(ch.record_type)} · <code>${esc(ch.identity)}</code></summary>
+    // Gaps absorb the records/fields they explain; list them so each is
+    // traceable to its original page without being counted twice.
+    const affected = (ch.affected || []).length
+      ? `<div class="muted">受影响的原有记录（已归入本缺口，不重复计数）：${ch.affected.map((a) =>
+          `<code>${esc(a.record_type)} ${esc(a.identity)}${a.field ? " · " + esc(a.field) : ""} @ ${esc((a.old_source || {}).page_id || "")}</code>`).join("")}</div>`
+      : "";
+    return `<details><summary><span class="diff-chg">${esc(ch.category)}</span> · ${esc(ch.record_type)} · <code>${esc(ch.identity)}</code>${(ch.affected || []).length ? ` <span class="muted">(${ch.affected.length} 条归入)</span>` : ""}</summary>
+      ${affected}
       <table class="grid"><thead><tr><th>字段</th><th>类别</th><th>旧值</th><th>新值</th><th>说明</th><th>对应原页 / 原始内容</th></tr></thead><tbody>${fields}</tbody></table></details>`;
   }).join("");
   $("diff-results").innerHTML = rows || "<p class='diff-add'>无业务数据变化（字段改名、列表换序、等价单位均已忽略）。</p>";

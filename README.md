@@ -24,7 +24,7 @@ python3 -I demo.py
 python3 -I run_tests.py
 ```
 
-47 个用例覆盖：嵌套归属、脏表格、跨页互补与冲突、单位等价、检出限/零/缺失语义、
+56 个用例覆盖：嵌套归属、脏表格、跨页互补与冲突、单位等价、检出限/零/缺失语义、
 分页中途失败与续跑、规则版本固定、基线拦截、不完整快照不得回归通过、Web API 与界面资源。
 
 ## 启动 Web 界面
@@ -62,7 +62,7 @@ corebench/
 tests/
   fixtures/rules/rule_v1.dsl, rule_v2.dsl     两版声明式规则
   fixtures/expected/expected.jsonl            人工编写的期望结果
-  test_*.py                                    47 个自动验证用例
+  test_*.py                                    56 个自动验证用例
 demo.py / serve.py / run_tests.py             演示、启动、测试入口
 ```
 
@@ -85,15 +85,22 @@ methods:
 
 规则可表达：表格选择器与表头层数、字段业务类型（文本/深度/浓度）与默认单位、
 记录身份字段、分析项与方法别名。两版规则（中文布局 A、英文布局 B）输出语义完全一致。
+关键表默认为 `required: true`，可用 `required: false` 显式降级为可选表。
 
 ## 关键行为约定
 
 * **跨页合并**：区间/样品按身份字段、测量按 `(样品, 项目, 方法)` 去重；同身份等价测量折叠，
   矛盾值生成 `conflicts` 并阻止基线确认；合并结果与页面顺序无关。
 * **差异分类**：`added` / `removed` / `value_changed` / `type_or_meaning_changed` /
-  `extraction_failed` / `unexplained_field`。字段改名、列表换序、等价单位表达不计为数据变化；
-  规则无法解释的原有字段产生 `unexplained_field`，不会被当作正常删除。
+  `extraction_failed` / `unexplained_field`。字段改名、列表换序、等价单位表达不计为数据变化。
+* **缺口按原页与字段归因、同一缺口只计一次**：规则无法解释的原有列或抽取失败，按
+  `孔号::原页::表::列/字段` 生成一个缺口（`unexplained_field` / `extraction_failed`），
+  被它解释的原有记录/字段挂在 `affected` 下，不再另记一笔 `removed`；同一列在不同原页是不同缺口，
+  同一页同一列的重复行合并为一个缺口。与缺口无关的页面仍按正常 `added`/`removed`/`value_changed`
+  分类，合法空值（`missing`）不会被当成缺口。基线中已存在的同一缺口不算回归。
+* **关键表失败拦截**：规则标为关键（默认）的表在某页找不到、解析失败或缺必需列时，
+  记为 critical 缺口，阻止基线确认与回归通过（`candidate_critical_gaps`）。
 * **安全保障**：运行开始即固定规则文本，运行期间保存新规则不影响在途运行；失败/未完成运行
   不能替换已确认基线；不完整快照的回归结论一律不通过。
 * **可追溯**：每条记录与错误都带 `page_id`、`url`、页面 `content_sha1`、表选择器、原始行/单元格文本
-  与规则版本，界面可直接查看对应原页 HTML。
+  与规则版本，界面可直接查看对应原页 HTML；缺口条目同样带原页与列信息。

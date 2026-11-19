@@ -24,6 +24,10 @@ class Warning_:
     page_id: str
     table: Optional[str] = None
     raw: Optional[str] = None
+    field: Optional[str] = None
+    critical: bool = False
+    url: Optional[str] = None
+    content_sha1: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         data = {"code": self.code, "message": self.message, "page_id": self.page_id}
@@ -31,7 +35,27 @@ class Warning_:
             data["table"] = self.table
         if self.raw is not None:
             data["raw"] = self.raw
+        if self.field:
+            data["field"] = self.field
+        if self.critical:
+            data["critical"] = True
+        if self.url:
+            data["url"] = self.url
+        if self.content_sha1:
+            data["content_sha1"] = self.content_sha1
         return data
+
+
+def _warn(result: "PageExtraction", code: str, message: str, table: Optional[str] = None,
+          raw: Optional[str] = None, field: Optional[str] = None, critical: bool = False,
+          provenance: Optional[Dict[str, Any]] = None) -> None:
+    """Record a warning tied to the exact original page and (when known) column."""
+    provenance = provenance or {}
+    result.warnings.append(Warning_(
+        code, message, result.page_id, table=table, raw=raw, field=field,
+        critical=critical, url=provenance.get("url"),
+        content_sha1=provenance.get("content_sha1"),
+    ))
 
 
 @dataclass
@@ -112,8 +136,8 @@ def extract_page(page, rule: Rule) -> PageExtraction:
     for key, spec in rule.tables.items():
         nodes = select_nodes(root, spec.selector)
         if not nodes:
-            result.warnings.append(Warning_("TABLE_NOT_FOUND", f"selector {spec.selector!r} matched nothing",
-                                            page.page_id, table=key))
+            _warn(result, "TABLE_NOT_FOUND", f"selector {spec.selector!r} matched nothing",
+                  table=key, critical=spec.required, provenance=provenance_base)
             continue
         for table_index, table_node in enumerate(nodes):
             try:
@@ -121,10 +145,9 @@ def extract_page(page, rule: Rule) -> PageExtraction:
                 table = build_table(table_node, header_layers=layers)
                 _extract_table(table, spec, rule, key, table_index, provenance_base, result)
             except Exception as exc:  # noqa: BLE001 - extraction failure is a recorded warning
-                result.warnings.append(
-                    Warning_("EXTRACTION_FAILED", f"{type(exc).__name__}: {exc}", page.page_id,
-                             table=key, raw=table_node.outer_html()[:2000])
-                )
+                _warn(result, "EXTRACTION_FAILED", f"{type(exc).__name__}: {exc}", table=key,
+                      raw=table_node.outer_html()[:2000], critical=spec.required,
+                      provenance=provenance_base)
     return result
 
 
@@ -179,14 +202,27 @@ def _extract_table(table: Table, spec: TableSpec, rule: Rule, table_key: str,
             if part_unit:
                 header_unit = part_unit
         unit_by_col[col] = header_unit
-        # Rule cannot interpret an existing column: record it so a later diff
-        # never mistakes an unexplained field for a normal deletion.
+        # Rule cannot interpret an existing column: record it (with the exact
+        # column on the exact original page) so a later diff can attribute the
+        # gap instead of mistaking it for a normal deletion.  A single
+        # unexplained column is a field-level gap: it blocks regression, but it
+        # does not mean the critical table itself failed to extract.
         if col not in explained_cols and any(part.strip() for part in path):
-            result.warnings.append(
-                Warning_("UNEXPLAINED_COLUMN",
-                         f"rule cannot interpret header {_header_key(path)!r} in table {table_key!r}",
-                         result.page_id, table=table_key, raw=" / ".join(path))
-            )
+            _warn(result, "UNEXPLAINED_COLUMN",
+                  f"rule cannot interpret header {_header_key(path)!r} in table {table_key!r}",
+                  table=table_key, raw=" / ".join(path), field=" / ".join(path),
+                  provenance=provenance_base)
+    # A critical table whose declared identity field has no matching column has
+    # silently lost the records that column identifies: that is a gap, not
+    # empty data.  (A missing *value* in a present column stays ordinary data.)
+    matched_field_names = {fs.name for fs in field_by_col.values()}
+    missing_fields = [name for name in spec.identity if name not in matched_field_names]
+    if missing_fields:
+        field_name = missing_fields[0]
+        _warn(result, "MISSING_REQUIRED_FIELD",
+              f"required identity field {field_name!r} has no matching column in table {table_key!r}",
+              table=table_key, field=field_name, raw=field_name,
+              critical=spec.required, provenance=provenance_base)
 
     for row in table.body_rows():
         cells = [row[c] if c < len(row) else None for c in range(table.ncols)]
@@ -199,6 +235,7 @@ def _extract_table(table: Table, spec: TableSpec, rule: Rule, table_key: str,
             "table_index": table_index,
             "selector": spec.selector,
             "raw_row": raw_row,
+            "field_provenance": {},
         }}
         identity_parts: Dict[str, str] = {}
         for col, field_spec in field_by_col.items():
@@ -207,6 +244,11 @@ def _extract_table(table: Table, spec: TableSpec, rule: Rule, table_key: str,
             unit = inline_unit or unit_by_col.get(col)
             typed = _coerce_field(field_spec, text, header_paths[col], unit)
             record["fields"][field_spec.name] = typed
+            record["provenance"]["field_provenance"][field_spec.name] = {
+                "page_id": provenance_base.get("page_id"),
+                "header_path": list(header_paths[col]),
+                "raw_cell": text,
+            }
             identity_parts[field_spec.name] = text
         record["identity"] = _build_identity(spec.identity, identity_parts, record["fields"])
         if table_key == rule.measurement_table:
@@ -250,20 +292,20 @@ def _extract_long_table(table: Table, header_paths, spec, rule, provenance_base,
     method_col = _find_col(header_paths, rule.long_format.method_labels)
     value_col = _find_col(header_paths, rule.long_format.value_labels)
     if None in (sample_col, analyte_col, method_col, value_col):
-        result.warnings.append(Warning_("EXTRACTION_FAILED",
-                                        "long-format assay table is missing a required column",
-                                        result.page_id, table=spec.key))
+        _warn(result, "EXTRACTION_FAILED",
+              "long-format assay table is missing a required column",
+              table=spec.key, critical=spec.required, provenance=provenance_base)
         return
     # Any header column the rule cannot map must never be silently dropped:
-    # it is recorded as unexplained so a later diff cannot call it a deletion.
+    # it is recorded as unexplained so a later diff can attribute it.
     explained = {sample_col, analyte_col, method_col, value_col}
     for col, path in enumerate(header_paths):
         if col in explained or not any(part.strip() for part in path):
             continue
-        result.warnings.append(Warning_(
-            "UNEXPLAINED_COLUMN",
-            f"rule cannot interpret header {_header_key(path)!r} in table {spec.key!r}",
-            result.page_id, table=spec.key, raw=" / ".join(path)))
+        _warn(result, "UNEXPLAINED_COLUMN",
+              f"rule cannot interpret header {_header_key(path)!r} in table {spec.key!r}",
+              table=spec.key, raw=" / ".join(path), field=" / ".join(path),
+              provenance=provenance_base)
     for row in table.body_rows():
         cells = [row[c] if c < len(row) else None for c in range(table.ncols)]
         if not any(cell and cell.clean for cell in cells):
@@ -276,9 +318,10 @@ def _extract_long_table(table: Table, header_paths, spec, rule, provenance_base,
         value_text, inline_unit = _split_inline_unit(cells[value_col].clean if cells[value_col] else "")
         analyte = rule.analyte_for([analyte_text])
         if analyte is None:
-            result.warnings.append(Warning_("UNEXPLAINED_COLUMN",
-                                            f"unknown analyte token {analyte_text!r}",
-                                            result.page_id, table=spec.key, raw=analyte_text))
+            _warn(result, "UNEXPLAINED_COLUMN",
+                  f"unknown analyte token {analyte_text!r}",
+                  table=spec.key, raw=analyte_text, field=analyte_text,
+                  provenance=provenance_base)
             continue
         parsed = parse_value(value_text, dimension="concentration", unit_hint=inline_unit)
         result.measurements.append({

@@ -129,6 +129,26 @@ class WebApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(fetched["report_id"], report["report_id"])
 
+    def test_07_critical_gap_blocks_web_baseline(self):
+        # A rule whose critical assay table cannot be found still completes the
+        # crawl, but the gap must be surfaced and block baseline confirmation.
+        broken = (rule_text(1)
+                  .replace("selector: table.assay-table", "selector: table.assay-gone"))
+        status, saved = post(self.base, "/api/rules/save",
+                             {"name": "drill-archive", "text": broken, "note": "broken"})
+        self.assertEqual(status, 200)
+        zk02 = [page for page in self.manifest if "zk02" in page["page_id"]]
+        post(self.base, "/api/runs/start",
+             {"run_id": "web-critical", "rule_id": saved["rule_id"], "pages": zk02})
+        status, run = post(self.base, "/api/runs/resume", {"run_id": "web-critical"})
+        self.assertEqual(status, 200)
+        self.assertTrue(run["has_critical_gaps"])
+        self.assertEqual({g["table"] for g in run["critical_gaps"]}, {"assay_table"})
+        status, payload = post(self.base, "/api/baselines/confirm",
+                               {"run_id": "web-critical"})
+        self.assertEqual(status, 400)
+        self.assertIn("critical", payload["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

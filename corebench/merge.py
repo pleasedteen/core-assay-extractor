@@ -87,11 +87,14 @@ def _merge_records(bucket: List[Dict[str, Any]], incoming: List[Dict[str, Any]],
             existing[ident] = record
             continue
         current = existing[ident]
+        current_prov = current["provenance"]
         for field_name, new_value in record["fields"].items():
             old_value = current["fields"].get(field_name)
+            new_field_prov = record["provenance"].get("field_provenance", {}).get(field_name)
             if old_value is None:
                 if not _is_missing(new_value):
                     current["fields"][field_name] = new_value
+                    _set_field_provenance(current_prov, field_name, new_field_prov, replace=True)
                 continue
             if _is_missing(new_value):
                 continue
@@ -102,7 +105,25 @@ def _merge_records(bucket: List[Dict[str, Any]], incoming: List[Dict[str, Any]],
                     values=[old_value, new_value],
                     sources=[current["provenance"], record["provenance"]],
                 ))
-        current["provenance"] = _merge_provenance(current["provenance"], record["provenance"])
+            _set_field_provenance(current_prov, field_name, new_field_prov, replace=False)
+        current["provenance"] = _merge_provenance(current_prov, record["provenance"])
+
+
+def _set_field_provenance(provenance: Dict[str, Any], field_name: str,
+                          new_field_prov: Optional[Dict[str, Any]], replace: bool) -> None:
+    """Merge per-field provenance so a field keeps every original page it came from."""
+    if not new_field_prov:
+        return
+    field_map = provenance.setdefault("field_provenance", {})
+    current = field_map.get(field_name)
+    if current is None or replace:
+        field_map[field_name] = dict(new_field_prov)
+        return
+    pages = list(current.get("page_ids") or ([current["page_id"]] if current.get("page_id") else []))
+    for page in ([new_field_prov["page_id"]] if new_field_prov.get("page_id") else []):
+        if page not in pages:
+            pages.append(page)
+    current["page_ids"] = pages
 
 
 def _merge_measurements(doc: BoreholeDocument, incoming: List[Dict[str, Any]]) -> None:
