@@ -104,6 +104,115 @@ DATASET: Dict[str, List[Dict[str, Any]]] = {
     ],
 }
 
+# ------------------------------------------------------- legacy encodings --
+# Old archives may mix encodings in one batch and their HTTP headers cannot be
+# trusted.  Each entry: (page dict, on-disk encoding, charset the header claims).
+#   * lp-utf8          real UTF-8, honest header
+#   * lp-gb-mislabeled real GB18030, header lies "utf-8" -> rule must correct it
+#   * lp-gb-honest     real GB18030, header tells the truth
+#   * lp-broken        undecodable bytes -> only raw bytes can be kept
+LEGACY_DATASET: List[Dict[str, Any]] = [
+    {
+        "page_id": "lp-utf8",
+        "encoding": "utf-8",
+        "declared": "utf-8",
+        "sample_id": "L1",
+        "interval_id": "LI-1",
+        "rock": "花岗岩",
+        "depth": "12.5",
+        "lithology": "中粒花岗岩",
+        "analyte": "Au",
+        "method": "火试金 FA",
+        "value": "0.11",
+        "unit": "mg/kg",
+    },
+    {
+        "page_id": "lp-gb-mislabeled",
+        "encoding": "gb18030",
+        "declared": "utf-8",               # the lie: bytes are GB18030
+        "sample_id": "L2",
+        "interval_id": "LI-1",
+        "rock": "花岗岩",
+        "depth": "13.5",
+        "lithology": "细粒花岗岩",
+        "analyte": "Cu",
+        "method": "ICP-AES",
+        "value": "42.1",
+        "unit": "mg/kg",
+    },
+    {
+        "page_id": "lp-gb-honest",
+        "encoding": "gb18030",
+        "declared": "gb18030",             # honest header, still no rule needed
+        "sample_id": "L3",
+        "interval_id": "LI-2",
+        "rock": "闪长岩",
+        "depth": "15.0",
+        "lithology": "闪长岩",
+        "analyte": "Zn",
+        "method": "ICP-AES",
+        "value": "0",
+        "unit": "mg/kg",
+    },
+    {
+        "page_id": "lp-broken",
+        "encoding": None,                  # bytes are invalid in every codec
+        "declared": "utf-8",
+        "sample_id": "L4",
+        "interval_id": "LI-2",
+        "rock": "闪长岩",
+        "depth": "16.0",
+        "lithology": "闪长岩",
+        "analyte": "Au",
+        "method": "火试金 FA",
+        "value": "0.02",
+        "unit": "mg/kg",
+    },
+]
+
+
+def render_legacy_page(page: Dict[str, Any]) -> str:
+    """Render a single-page archive record in the Chinese (layout A) markup."""
+    borehole = page["borehole_id"] if "borehole_id" in page else "LG01"
+    interval = {"interval_id": page["interval_id"], "from": "10.0", "to": "20.0",
+                "rock": page["rock"]}
+    sample = {"sample_id": page["sample_id"], "interval_id": page["interval_id"],
+              "depth": page["depth"], "lithology": page["lithology"]}
+    assay = {"sample_id": page["sample_id"],
+             "rows": [(page["analyte"], page["method"], page["value"], page["unit"])]}
+    synthetic = {
+        "page_id": page["page_id"],
+        "title": f"旧档案 {page['page_id']}",
+        "intervals": [interval],
+        "samples": [sample],
+        "assays": [assay],
+    }
+    return render_page(borehole, synthetic, layout_b=False)
+
+
+def legacy_page_bytes(page: Dict[str, Any]) -> bytes:
+    markup = render_legacy_page(page)
+    if page["encoding"] is None:
+        # Deliberately invalid in UTF-8 and GB18030: 0xFF is not a lead byte.
+        raw = markup.encode("utf-8") + b"\xff\xfe broken tail"
+    else:
+        raw = markup.encode(page["encoding"])
+    return raw
+
+
+def write_legacy_static_site(directory: str) -> List[Dict[str, str]]:
+    """Write the mixed-encoding fixture pages as raw bytes, returning a manifest."""
+    import os
+    os.makedirs(directory, exist_ok=True)
+    manifest = []
+    for page in LEGACY_DATASET:
+        path = os.path.join(directory, f"{page['page_id']}.html")
+        with open(path, "wb") as handle:
+            handle.write(legacy_page_bytes(page))
+        manifest.append({"page_id": page["page_id"], "url": path})
+    return manifest
+
+
 # Layout B: renamed labels/classes, equivalent unit spellings, cm depths.
 LAYOUT_B = {
     "borehole_label": "Hole ID",
@@ -363,6 +472,17 @@ class MockHandler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             self._reply(200, render_index())
             return
+        if path.startswith("/legacy/"):
+            page_id = path[len("/legacy/"):].strip("/")
+            for page in LEGACY_DATASET:
+                if page["page_id"] == page_id:
+                    # Deliberately serve the bytes with the page's declared
+                    # charset, which for one page is a lie.
+                    self._reply_bytes(200, legacy_page_bytes(page),
+                                      f"text/html; charset={page['declared']}")
+                    return
+            self._reply(404, "not found")
+            return
         layout_b = path.startswith("/site-b/")
         prefix = "/site-b/" if layout_b else "/site/"
         if path.startswith(prefix):
@@ -396,7 +516,10 @@ class MockHandler(BaseHTTPRequestHandler):
         self._reply(404, "not found")
 
     def _reply(self, status: int, body: str, content_type: str = "text/html; charset=utf-8") -> None:
-        encoded = body.encode("utf-8")
+        self._reply_bytes(status, body.encode("utf-8"), content_type)
+
+    def _reply_bytes(self, status: int, encoded: bytes,
+                     content_type: str = "text/html; charset=utf-8") -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(encoded)))

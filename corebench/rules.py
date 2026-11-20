@@ -70,6 +70,26 @@ class LongFormatSpec:
 
 
 @dataclass
+class EncodingSpec:
+    """Declarative per-page text encoding.
+
+    Archive headers are not trusted: a page may be GB18030 while the response
+    claims UTF-8, and one batch may mix encodings.  ``pages`` corrects one page
+    by id, ``default`` covers the rest of the batch.  Encoding names are
+    validated when the rule is loaded, so a typo cannot be saved.
+    """
+
+    default: Optional[str] = None
+    pages: Dict[str, str] = field(default_factory=dict)
+
+    def for_page(self, page_id: str) -> Optional[str]:
+        return self.pages.get(page_id)
+
+    def is_empty(self) -> bool:
+        return not self.default and not self.pages
+
+
+@dataclass
 class Rule:
     name: str
     rule_version: str
@@ -81,6 +101,7 @@ class Rule:
     measurement_table: str
     long_format: Optional[LongFormatSpec]
     raw: Dict[str, Any]
+    encoding: EncodingSpec = field(default_factory=EncodingSpec)
 
     # ------------------------------------------------------------------ load
     @classmethod
@@ -129,6 +150,7 @@ class Rule:
                 method_labels=list(long_cfg.get("method_column") or []),
                 value_labels=list(long_cfg.get("value_column") or []),
             )
+        encoding = _parse_encoding(data.get("encoding"))
         return cls(
             name=str(data.get("name", "unnamed rule")),
             rule_version=str(data.get("rule_version", data.get("version", "0"))),
@@ -140,6 +162,7 @@ class Rule:
             measurement_table=measurement_table,
             long_format=long_format,
             raw=data,
+            encoding=encoding,
         )
 
     # --------------------------------------------------------------- helpers
@@ -159,6 +182,29 @@ class Rule:
 
     def to_text(self) -> str:
         return dsl.dump(self.raw)
+
+
+def _parse_encoding(raw: Any) -> "EncodingSpec":
+    from .charset import normalize_encoding
+
+    if raw is None:
+        return EncodingSpec()
+    if isinstance(raw, str):
+        raw = {"default": raw}
+    if not isinstance(raw, dict):
+        raise ValueError("rule 'encoding' section must be a mapping or a single name")
+    default = raw.get("default")
+    if default is not None:
+        default = normalize_encoding(default)
+    pages_raw = raw.get("pages") or {}
+    if not isinstance(pages_raw, dict):
+        raise ValueError("rule 'encoding.pages' must map page ids to encoding names")
+    pages: Dict[str, str] = {}
+    for page_id, name in pages_raw.items():
+        if name is None:
+            continue
+        pages[str(page_id)] = normalize_encoding(name)
+    return EncodingSpec(default=default, pages=pages)
 
 
 def _norm(label: str) -> str:

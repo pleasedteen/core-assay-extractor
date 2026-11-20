@@ -75,13 +75,61 @@ class WorkbenchApp:
         candidate = self.store.load_run(payload["candidate_run_id"])
         return regression_report(self.store, baseline, candidate)
 
-    def snapshot_page(self, snapshot_id: str, page_id: str) -> Optional[Dict[str, Any]]:
+    def snapshot_page(self, snapshot_id: str, page_id: str,
+                      encoding: Optional[str] = None,
+                      run_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         snapshot = self.snapshots.load(snapshot_id)
         page = snapshot.get(page_id)
         if page is None:
             return None
-        return {"page_id": page.page_id, "url": page.url, "html": page.html,
-                "content_sha1": page.content_sha1, "failures": snapshot.failures}
+        # Report what the requested run actually used for this page.  Without a
+        # run (or when viewing a correction) fall back to the snapshot's own
+        # recorded encoding.
+        selected = None
+        if run_id:
+            try:
+                run = self.store.load_run(run_id)
+                selected = next((item for item in run.get("page_encodings", [])
+                                 if item.get("page_id") == page_id), None)
+            except FileNotFoundError:
+                selected = None
+        run_encoding = selected if selected else {
+            "encoding": page.encoding,
+            "encoding_source": page.encoding_source,
+            "declared_encoding": page.declared_encoding,
+            "status": page.status,
+            "overridden": page.encoding_overridden,
+        }
+        view = page
+        requested_encoding = None
+        if encoding:
+            requested_encoding = encoding
+            view = page.decoded_elsewhere(encoding)
+        elif run_id and run_encoding.get("encoding"):
+            # Show the text the requested run actually derived, which may have
+            # been re-decoded from the frozen bytes by a rule correction.
+            view = page.decoded_elsewhere(run_encoding["encoding"])
+            view.encoding_source = str(run_encoding.get("encoding_source") or view.encoding_source)
+        data = {
+            "page_id": page.page_id,
+            "url": page.url,
+            "html": view.html,
+            "content_sha1": page.content_sha1,
+            "failures": snapshot.failures,
+            "encoding": view.encoding if (requested_encoding or run_id)
+                        else run_encoding.get("encoding"),
+            "encoding_source": view.encoding_source if (requested_encoding or run_id)
+                               else run_encoding.get("encoding_source"),
+            "declared_encoding": page.declared_encoding,
+            "status": view.status,
+            "decode_error": view.decode_error,
+            "run_encoding": run_encoding,
+            "requested_encoding": requested_encoding,
+            "has_raw_bytes": page.raw is not None,
+            "legacy_text_only": page.is_legacy,
+            "undecodable": view.is_undecodable,
+        }
+        return data
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -145,7 +193,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._json({"lines": lines})
             return
         if path == "/api/snapshot-page":
-            data = self.app.snapshot_page(query["snapshot_id"][0], query["page_id"][0])
+            data = self.app.snapshot_page(
+                query["snapshot_id"][0], query["page_id"][0],
+                encoding=query.get("encoding", [None])[0],
+                run_id=query.get("run_id", [None])[0])
             if data is None:
                 self._error(404, "page not in snapshot")
             else:

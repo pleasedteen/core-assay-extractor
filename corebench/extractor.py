@@ -62,6 +62,20 @@ def page_url(extraction: PageExtraction) -> str:
     return extraction.url
 
 
+def _provenance_base(page) -> Dict[str, Any]:
+    """Page identity plus the encoding its text was actually decoded with."""
+    base: Dict[str, Any] = {
+        "page_id": page.page_id,
+        "url": page.url,
+        "content_sha1": page.content_sha1,
+    }
+    encoding = getattr(page, "encoding", None)
+    if encoding:
+        base["encoding"] = encoding
+        base["encoding_source"] = getattr(page, "encoding_source", None)
+    return base
+
+
 def select_nodes(root: Node, selector: str) -> List[Node]:
     """Very small selector: tag, ``.class`` or ``tag.class`` (no combinators)."""
     selector = selector.strip()
@@ -100,14 +114,26 @@ def _coerce_field(field_spec, cell_text: str, header_path: Sequence[str],
 
 
 def extract_page(page, rule: Rule) -> PageExtraction:
-    root = parse_html(page.html)
     result = PageExtraction(
         page_id=page.page_id, url=page.url, content_sha1=page.content_sha1,
         borehole_id=None,
     )
+    provenance_base = _provenance_base(page)
+    if getattr(page, "is_undecodable", False):
+        # The bytes were kept in the snapshot, but they cannot be decoded with
+        # the chosen encoding.  Report that instead of extracting from broken
+        # replacement text; a rule that names the right encoding can fix this
+        # on a later replay of the same frozen bytes.
+        result.warnings.append(
+            Warning_("DECODE_FAILED",
+                     f"page bytes are not valid {page.encoding or 'unknown encoding'}"
+                     + (f": {page.decode_error}" if page.decode_error else ""),
+                     page.page_id, raw=f"<{len(page.raw or b'')} bytes kept>")
+        )
+        return result
 
+    root = parse_html(page.html)
     result.borehole_id = _extract_borehole_id(root, rule, result)
-    provenance_base = {"page_id": page.page_id, "url": page.url, "content_sha1": page.content_sha1}
 
     for key, spec in rule.tables.items():
         nodes = select_nodes(root, spec.selector)

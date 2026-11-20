@@ -89,6 +89,8 @@ def _source_ref(provenance: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]
         "raw_row": provenance.get("raw_row"),
         "raw_cell": provenance.get("raw_cell"),
         "header_path": provenance.get("header_path"),
+        "encoding": provenance.get("encoding"),
+        "encoding_source": provenance.get("encoding_source"),
     }
 
 
@@ -156,10 +158,18 @@ def _record_type(key: Tuple[str, str]) -> str:
 
 
 def _record_disappeared_due_to_failure(key, old_record, new_rows) -> bool:
+    old_table = old_record.get("provenance", {}).get("table")
+    old_page = old_record.get("provenance", {}).get("page_id")
     for row in new_rows:
         for warning in row.get("warnings", []):
-            if warning.get("code") in ("EXTRACTION_FAILED", "TABLE_NOT_FOUND"):
-                if warning.get("table") == old_record.get("provenance", {}).get("table"):
+            code = warning.get("code")
+            if code in ("EXTRACTION_FAILED", "TABLE_NOT_FOUND"):
+                if warning.get("table") == old_table:
+                    return True
+            elif code == "DECODE_FAILED":
+                # A page whose bytes cannot be decoded explains every record it
+                # used to carry -- never mistake that for a real deletion.
+                if warning.get("page_id") == old_page:
                     return True
     return False
 
@@ -215,7 +225,8 @@ def _diff_warnings(old_rows: List[Dict[str, Any]], new_rows: List[Dict[str, Any]
     old_warnings = _all_warnings(old_rows)
     old_seen = {(w["code"], w.get("table"), w.get("page_id"), w.get("raw")) for w in old_warnings}
     for warning in new_warnings:
-        if warning["code"] not in ("EXTRACTION_FAILED", "UNEXPLAINED_COLUMN", "TABLE_NOT_FOUND"):
+        if warning["code"] not in ("EXTRACTION_FAILED", "UNEXPLAINED_COLUMN",
+                                   "TABLE_NOT_FOUND", "DECODE_FAILED"):
             continue
         signature = (warning["code"], warning.get("table"), warning.get("page_id"), warning.get("raw"))
         if signature in old_seen:
@@ -282,6 +293,12 @@ def regression_report(store, baseline: Dict[str, Any], candidate_run: Dict[str, 
         "candidate_status": candidate_run["status"],
         "candidate_has_conflicts": candidate_run.get("has_conflicts", False),
     })
+    # Pages whose bytes could not be decoded are surfaced with the report so a
+    # comparison never hides unreadable content behind a passing summary.
+    decode_failures = [item for item in candidate_run.get("page_encodings", [])
+                       if item.get("status") == "undecodable"]
+    if decode_failures:
+        report["candidate_decode_failures"] = decode_failures
     snapshot_complete = snapshot.is_complete if snapshot is not None else True
     # An incomplete snapshot can never produce a passing regression: missing
     # pages would hide deletions and failures instead of proving equivalence.

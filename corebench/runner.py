@@ -39,6 +39,19 @@ class RunEngine:
         self.snapshot_store = snapshot_store
         self.fetcher = fetcher
 
+    # ----------------------------------------------------------- decoding ---
+    @staticmethod
+    def _apply_encoding(page: PageContent, rule: Rule) -> PageContent:
+        """Decode a frozen page with the rule's encoding choice.
+
+        The raw bytes are always retained, so a rule can correct the encoding
+        of one page of a mixed batch, and an undecodable page is kept as bytes
+        plus a recorded failure instead of losing data.
+        """
+        if page.is_legacy:
+            return page
+        return page.with_encoding(rule.encoding)
+
     # ----------------------------------------------------------- lifecycle --
     def start(self, config: RunConfig) -> Dict[str, Any]:
         run = {
@@ -91,6 +104,7 @@ class RunEngine:
                     return run
                 # A retried page that now succeeds clears its failure marker.
                 snapshot.failures.pop(entry["page_id"], None)
+                page = self._apply_encoding(page, rule)
                 snapshot.pages.append(page)
                 entry["state"] = STATUS_COMPLETED
                 entry["error"] = None
@@ -99,8 +113,9 @@ class RunEngine:
                 self.snapshot_store.save(snapshot)
                 self.store.save_run(run)
 
-            extractions = [extract_page(page, rule) for page in
-                           sorted(snapshot.pages, key=lambda p: p.page_id)]
+            pages = [self._apply_encoding(page, rule) for page in
+                     sorted(snapshot.pages, key=lambda p: p.page_id)]
+            extractions = [extract_page(page, rule) for page in pages]
             documents = merge_extractions(extractions)
             output_path = self.store.run_output_path(run_id)
             write_jsonl(documents, output_path)
@@ -110,6 +125,7 @@ class RunEngine:
             run["has_conflicts"] = has_blocking_conflicts(documents)
             run["has_warnings"] = any(doc.warnings for doc in documents)
             run["output_path"] = output_path
+            run["page_encodings"] = [page_decoding_record(page) for page in pages]
             self.store.save_run(run)
             self.snapshot_store.save(snapshot)
             return run
@@ -122,13 +138,19 @@ class RunEngine:
     # ------------------------------------------------------------- replay ---
     def replay(self, run_id: str, rule_text: Optional[str] = None,
                new_run_id: Optional[str] = None) -> Dict[str, Any]:
-        """Re-run extraction on the frozen snapshot, optionally with new rules."""
+        """Re-run extraction on the frozen snapshot, optionally with new rules.
+
+        The snapshot keeps raw bytes, so a candidate rule can also correct a
+        page's encoding; this works even when the source site is gone.  Legacy
+        snapshots that only hold decoded text replay with that original text.
+        """
         original = self.store.load_run(run_id)
         snapshot = self.snapshot_store.load(original["snapshot_id"])
         text = rule_text if rule_text is not None else original["rule_text"]
         rule = Rule.from_text(text)
-        extractions = [extract_page(page, rule) for page in
-                       sorted(snapshot.pages, key=lambda p: p.page_id)]
+        pages = [self._apply_encoding(page, rule) for page in
+                 sorted(snapshot.pages, key=lambda p: p.page_id)]
+        extractions = [extract_page(page, rule) for page in pages]
         documents = merge_extractions(extractions)
         replay_id = new_run_id or f"{run_id}-replay-{int(time.time() * 1000)}"
         output_path = self.store.run_output_path(replay_id)
@@ -149,6 +171,26 @@ class RunEngine:
             "error": None,
             "replayed_from": run_id,
             "snapshot_complete": snapshot.is_complete,
+            "page_encodings": [page_decoding_record(page) for page in pages],
         }
         self.store.save_run(replay_run)
         return replay_run
+
+
+def page_decoding_record(page: PageContent) -> Dict[str, Any]:
+    """A compact, traceable record of how one page's text was obtained."""
+    record = {
+        "page_id": page.page_id,
+        "url": page.url,
+        "content_sha1": page.content_sha1,
+        "encoding": page.encoding,
+        "encoding_source": page.encoding_source,
+        "declared_encoding": page.declared_encoding,
+        "status": page.status,
+        "overridden": page.encoding_overridden,
+    }
+    if page.is_legacy:
+        record["legacy_text_only"] = True
+    if page.decode_error:
+        record["decode_error"] = page.decode_error
+    return record

@@ -145,19 +145,46 @@ async function showOutput(runId) {
 
 async function showProvenance(runId) {
   const run = await api(`/api/run?id=${encodeURIComponent(runId)}`);
-  const pages = run.pages.map((p) => `<li><button class="ghost" data-page="${esc(p.page_id)}">${esc(p.page_id)} <span class="tag ${esc(p.state)}">${esc(p.state)}</span></button>
-    ${p.error ? `<span class="diff-del">${esc(p.error)}</span>` : ""}</li>`).join("");
+  const encodings = {};
+  (run.page_encodings || []).forEach((item) => { encodings[item.page_id] = item; });
+  const pages = run.pages.map((p) => {
+    const enc = encodings[p.page_id];
+    const encTag = enc ? ` · <span class="muted">编码 ${esc(enc.encoding)}${enc.overridden ? "（规则纠正）" : ""}</span>` : "";
+    return `<li><button class="ghost" data-page="${esc(p.page_id)}">${esc(p.page_id)} <span class="tag ${esc(p.state)}">${esc(p.state)}</span></button>${encTag}
+    ${p.error ? `<span class="diff-del">${esc(p.error)}</span>` : ""}</li>`;
+  }).join("");
   $("run-output").innerHTML = `<p>快照 <code>${esc(run.snapshot_id)}</code>，点击页面查看原始 HTML：</p><ul>${pages}</ul><div id="source-view"></div>`;
   $("run-output").querySelectorAll("[data-page]").forEach((b) => b.addEventListener("click", () => showSourcePage(runId, b.dataset.page)));
 }
 
-async function showSourcePage(runId, pageId) {
+async function showSourcePage(runId, pageId, encoding) {
   const run = await api(`/api/run?id=${encodeURIComponent(runId)}`);
-  const data = await api(`/api/snapshot-page?snapshot_id=${encodeURIComponent(run.snapshot_id)}&page_id=${encodeURIComponent(pageId)}`);
-  $("source-view") ? null : null;
+  let url = `/api/snapshot-page?snapshot_id=${encodeURIComponent(run.snapshot_id)}&page_id=${encodeURIComponent(pageId)}&run_id=${encodeURIComponent(runId)}`;
+  if (encoding) url += `&encoding=${encodeURIComponent(encoding)}`;
+  const data = await api(url);
   const target = $("source-view") || $("run-output");
+  const runEnc = data.run_encoding || {};
+  const encLabel = data.requested_encoding
+    ? `查看编码 ${esc(data.encoding)}（运行实际使用 ${esc(runEnc.encoding || "未知")}）`
+    : `运行使用编码 <code>${esc(runEnc.encoding || "未知")}</code>` +
+      `（来源：${esc(runEnc.encoding_source || "未知")}` +
+      (runEnc.overridden ? "，规则纠正" : "") +
+      (runEnc.declared_encoding ? `；响应头声明 ${esc(runEnc.declared_encoding)}` : "") + "）";
+  const status = data.undecodable
+    ? `<p class="diff-del">解码失败：${esc(data.decode_error || "字节无法按所选编码解码")}；原始字节已保留在快照中。</p>`
+    : "";
+  const legacy = data.legacy_text_only
+    ? `<p class="muted">旧快照仅保存了解码文本，按原文本回放。</p>` : "";
   target.innerHTML += `<details open><summary>原页 ${esc(pageId)} · ${esc(data.url)} · sha1 <code>${esc(data.content_sha1.slice(0, 12))}</code></summary>
+    <p class="muted">${encLabel}</p>${status}${legacy}
+    <div class="row"><label>以指定编码重新查看 <input type="text" class="enc-input" data-page="${esc(pageId)}" value="${esc(data.requested_encoding || "")}" placeholder="如 gb18030"></label></div>
     <pre class="raw">${esc(data.html)}</pre></details>`;
+  target.querySelectorAll(".enc-input").forEach((input) => input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && input.value.trim()) {
+      ev.preventDefault();
+      showSourcePage(runId, input.dataset.page, input.value.trim());
+    }
+  }));
 }
 
 // ------------------------------------------------------------------ diff
@@ -184,15 +211,18 @@ $("btn-diff").addEventListener("click", async () => {
 
 function renderDiff(report) {
   const passed = report.regression_passed;
+  const decode = (report.candidate_decode_failures || [])
+    .map((item) => `${esc(item.page_id)}（${esc(item.encoding)}）`).join("、");
   $("diff-summary").innerHTML = `回归结论：<b class="${passed ? "diff-add" : "diff-del"}">${passed ? "通过" : "未通过"}</b>
-    · 统计 ${esc(JSON.stringify(report.summary))} · 快照完整：${report.snapshot_complete ? "是" : '<span class="diff-del">否</span>'}`;
+    · 统计 ${esc(JSON.stringify(report.summary))} · 快照完整：${report.snapshot_complete ? "是" : '<span class="diff-del">否</span>'}`
+    + (decode ? `<br><span class="diff-del">候选运行有解码失败页：${decode}；原始字节已保留，可纠正编码后重放。</span>` : "");
   const rows = report.changes.map((ch) => {
     const fields = ch.field_changes.map((fc) => {
       const src = fc.new_source || fc.old_source || ch.new_source || ch.old_source || {};
       return `<tr><td>${esc(fc.field)}</td><td><span class="tag ${fc.category === "value_changed" ? "conflict" : "censored"}">${esc(fc.category)}</span></td>
         <td class="diff-del">${esc(JSON.stringify(fc.old))}</td><td class="diff-add">${esc(JSON.stringify(fc.new))}</td>
         <td>${esc(fc.detail || "")}</td>
-        <td class="muted">${esc(src.page_id || "")} ${esc(src.table || "")} ${esc((src.raw_row || []).join(" | "))}${src.raw_cell ? " | cell=" + esc(src.raw_cell) : ""}</td></tr>`;
+        <td class="muted">${esc(src.page_id || "")} ${esc(src.table || "")} ${esc((src.raw_row || []).join(" | "))}${src.raw_cell ? " | cell=" + esc(src.raw_cell) : ""}${src.encoding ? " · 编码=" + esc(src.encoding) : ""}</td></tr>`;
     }).join("");
     return `<details><summary><span class="diff-chg">${esc(ch.category)}</span> · ${esc(ch.record_type)} · <code>${esc(ch.identity)}</code></summary>
       <table class="grid"><thead><tr><th>字段</th><th>类别</th><th>旧值</th><th>新值</th><th>说明</th><th>对应原页 / 原始内容</th></tr></thead><tbody>${fields}</tbody></table></details>`;

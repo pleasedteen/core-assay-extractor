@@ -10,7 +10,8 @@ It starts the in-process mock drill-archive site, then walks the whole story:
 4. confirm a clean baseline, replay on the frozen snapshot and produce an
    empty semantic diff;
 5. demonstrate a value-change regression and an unexplained-column failure;
-6. export machine-readable JSON reports and JSONL output.
+6. correct a mixed-encoding batch page by page on the frozen snapshot;
+7. export machine-readable JSON reports and JSONL output.
 
 Run:  python3 -I demo.py
 """
@@ -131,6 +132,32 @@ def main() -> int:
               f"{change['category']} {detail}")
     report_path = store.save_report("demo-change-report", changed)
     print(f"  机器可读报告已导出: {report_path}")
+
+    # ------------------------------------------------------ 5b. encodings
+    hr("5b. 混合编码批次：响应头谎称 UTF-8，规则按页纠正；解码失败保留字节")
+    enc_manifest = [
+        {"page_id": page["page_id"], "url": f"{base_url}/legacy/{page['page_id']}"}
+        for page in mock_site.LEGACY_DATASET
+    ]
+    engine.start(RunConfig("enc-raw", v1["rule_id"], v1["text"], enc_manifest))
+    enc_run = engine.run("enc-raw")
+    for record in enc_run["page_encodings"]:
+        print(f"  {record['page_id']:<18} 编码={record['encoding']:<8} "
+              f"来源={record['encoding_source']:<8} 状态={record['status']}")
+    fixed_text = (v1["text"].rstrip("\n")
+                  + "\nencoding:\n  pages:\n    lp-gb-mislabeled: gb18030\n")
+    Rule.from_text(fixed_text)
+    enc_fixed = engine.replay("enc-raw", rule_text=fixed_text, new_run_id="enc-fixed")
+    print("  按页纠正后:")
+    for record in enc_fixed["page_encodings"]:
+        print(f"  {record['page_id']:<18} 编码={record['encoding']:<8} "
+              f"来源={record['encoding_source']:<12} 状态={record['status']}")
+    enc_rows = read_jsonl(enc_fixed["output_path"])
+    samples = [s["fields"]["sample_id"]["value"] for row in enc_rows for s in row["samples"]]
+    print(f"  纠正后读出的样品: {samples}（lp-broken 仍保留原始字节、未伪造文本）")
+    for record in enc_fixed["page_encodings"]:
+        if record["status"] == "undecodable":
+            print(f"  解码失败页 {record['page_id']}：原始字节保留，记录为 DECODE_FAILED")
 
     # ------------------------------------------------------------- 6. outputs
     hr("6. 产物清单")
