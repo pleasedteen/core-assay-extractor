@@ -76,6 +76,9 @@ class WorkbenchStore:
     def load_run(self, run_id: str) -> Dict[str, Any]:
         return _read_json(self.run_path(run_id))
 
+    def run_exists(self, run_id: str) -> bool:
+        return os.path.exists(self.run_path(run_id))
+
     def list_runs(self) -> List[Dict[str, Any]]:
         items = []
         if not os.path.isdir(self.runs_dir):
@@ -105,6 +108,9 @@ class WorkbenchStore:
 
     def get_baseline(self, baseline_id: str) -> Dict[str, Any]:
         return _read_json(os.path.join(self.baselines_dir, f"{baseline_id}.json"))
+
+    def baseline_exists(self, baseline_id: str) -> bool:
+        return os.path.exists(os.path.join(self.baselines_dir, f"{baseline_id}.json"))
 
     # ------------------------------------------------------------ reports ----
     def save_report(self, report_id: str, payload: Dict[str, Any]) -> str:

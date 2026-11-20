@@ -15,11 +15,14 @@ can no longer interpret -- never downgraded to a plain removal).
 """
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from .errors import RunConflictError
 from .merge import read_jsonl
+from .runner import STATUS_COMPLETED
 from .values import values_equivalent
 
 CHANGE_ADDED = "added"
@@ -253,6 +256,10 @@ def confirm_baseline(store, run: Dict[str, Any], snapshot, note: str = "") -> Di
     if not snapshot.is_complete:
         raise ValueError("snapshot is incomplete (failed pages); cannot confirm baseline")
     baseline_id = f"baseline-{run['run_id']}"
+    if hasattr(store, "baseline_exists") and store.baseline_exists(baseline_id):
+        raise RunConflictError(
+            f"baseline {baseline_id!r} is already confirmed; re-confirming would "
+            "overwrite the accepted baseline")
     baseline = {
         "baseline_id": baseline_id,
         "run_id": run["run_id"],
@@ -271,9 +278,21 @@ def regression_report(store, baseline: Dict[str, Any], candidate_run: Dict[str, 
     """Compare a candidate run against a baseline, both on the same snapshot."""
     if baseline["snapshot_id"] != candidate_run["snapshot_id"]:
         raise ValueError("regression comparison requires the same complete snapshot")
+    # Unpublished results never participate in a comparison: a run that has not
+    # completed (still running, failed, or killed during publish) has no atomic
+    # output to read, and must not be silently treated as an empty candidate.
+    if candidate_run.get("status") != STATUS_COMPLETED:
+        raise ValueError(
+            f"candidate run {candidate_run.get('run_id')!r} is "
+            f"{candidate_run.get('status')}; only completed, published runs can be compared")
+    output_path = candidate_run.get("output_path")
+    if not output_path or not os.path.exists(output_path):
+        raise ValueError(
+            f"candidate run {candidate_run.get('run_id')!r} has no published output; "
+            "unpublished results cannot participate in a comparison")
     snapshot = store.snapshots.load(baseline["snapshot_id"]) if hasattr(store, "snapshots") else None
     old_rows = read_jsonl(baseline["output_path"])
-    new_rows = read_jsonl(candidate_run["output_path"])
+    new_rows = read_jsonl(output_path)
     report = compare_runs(old_rows, new_rows)
     report.update({
         "baseline_id": baseline["baseline_id"],

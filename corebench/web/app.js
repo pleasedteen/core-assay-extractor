@@ -89,12 +89,20 @@ async function loadRuns() {
     <td>${esc(r.started_at)}</td>
     <td>
       <button class="ghost" data-resume="${esc(r.run_id)}">续跑/重放</button>
+      <button class="ghost" data-progress="${esc(r.run_id)}">查进度</button>
       <button class="ghost" data-output="${esc(r.run_id)}">查看结果</button>
       <button class="ghost" data-source="${esc(r.run_id)}">原页溯源</button>
     </td></tr>`).join("");
   tbody.querySelectorAll("[data-resume]").forEach((b) => b.addEventListener("click", async () => {
     try { await api("/api/runs/resume", { run_id: b.dataset.resume }); toast("运行已推进"); await refreshAll(); }
     catch (exc) { toast(exc.message); }
+  }));
+  tbody.querySelectorAll("[data-progress]").forEach((b) => b.addEventListener("click", async () => {
+    try {
+      const p = await api(`/api/run-progress?id=${encodeURIComponent(b.dataset.progress)}`);
+      const flying = p.in_flight_page ? `，正在抓取 ${esc(p.in_flight_page)}` : "";
+      toast(`进度 ${p.completed_pages}/${p.total_pages}（${p.percent_done}%）· 状态 ${p.status}${flying}`);
+    } catch (exc) { toast(exc.message); }
   }));
   tbody.querySelectorAll("[data-output]").forEach((b) => b.addEventListener("click", () => showOutput(b.dataset.output)));
   tbody.querySelectorAll("[data-source]").forEach((b) => b.addEventListener("click", () => showProvenance(b.dataset.source)));

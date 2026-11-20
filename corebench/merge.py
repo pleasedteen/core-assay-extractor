@@ -13,6 +13,7 @@ its measurements.  Merging is identity based and order independent:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -152,9 +153,13 @@ def _merge_provenance(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def write_jsonl(documents: List[BoreholeDocument], path: str) -> str:
-    with open(path, "w", encoding="utf-8") as handle:
+    # Atomic publish: a crash mid-write never leaves a half-written output that
+    # a later resume or a regression comparison could mistake for results.
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
         for doc in documents:
             handle.write(json.dumps(doc.to_jsonl_obj(), ensure_ascii=False, sort_keys=True) + "\n")
+    os.replace(tmp, path)
     return path
 
 

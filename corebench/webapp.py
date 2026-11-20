@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional
 
 from .diff import confirm_baseline, regression_report
+from .errors import RunConflictError
 from .runner import RunConfig, RunEngine
 from .rules import Rule
 from .sources import SnapshotStore
@@ -29,12 +29,6 @@ class WorkbenchApp:
         # Expose snapshots on the store so diffing can verify completeness.
         self.store.snapshots = self.snapshots
         self.engine = RunEngine(self.store, self.snapshots)
-        self._run_locks: Dict[str, threading.Lock] = {}
-        self._locks_guard = threading.Lock()
-
-    def _lock_for(self, run_id: str) -> threading.Lock:
-        with self._locks_guard:
-            return self._run_locks.setdefault(run_id, threading.Lock())
 
     # ----------------------------------------------------------------- rules
     def save_rule(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -52,11 +46,16 @@ class WorkbenchApp:
             pages=payload["pages"],
             note=payload.get("note", ""),
         )
+        # Idempotent on an identical retry; raises RunConflictError otherwise.
         return self.engine.start(config)
 
     def resume_run(self, run_id: str) -> Dict[str, Any]:
-        with self._lock_for(run_id):
-            return self.engine.run(run_id)
+        # The engine serialises calls per run id: a duplicated resume joins the
+        # in-flight pass instead of double-fetching, while other runs proceed.
+        return self.engine.run(run_id)
+
+    def run_progress(self, run_id: str) -> Dict[str, Any]:
+        return self.engine.progress(run_id)
 
     def replay_run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         candidate_text = None
@@ -96,6 +95,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._handle_get()
         except FileNotFoundError as exc:
             self._error(404, str(exc))
+        except RunConflictError as exc:
+            self._error(409, str(exc))
         except (ValueError, KeyError) as exc:
             self._error(400, f"{type(exc).__name__}: {exc}")
         except Exception as exc:  # noqa: BLE001 - keep the API alive
@@ -131,6 +132,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         if path == "/api/run":
             run = self.app.store.load_run(query["id"][0])
             self._json(run)
+            return
+        if path == "/api/run-progress":
+            # Lightweight checkpoint view; never blocks on a slow in-flight page.
+            self._json(self.app.run_progress(query["id"][0]))
             return
         if path == "/api/output":
             run = self.app.store.load_run(query["run_id"][0])
@@ -172,6 +177,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._error(404, "unknown endpoint")
         except FileNotFoundError as exc:
             self._error(404, str(exc))
+        except RunConflictError as exc:
+            # Id reuse with a different intent, or a protected confirmed baseline.
+            self._error(409, str(exc))
         except (ValueError, KeyError) as exc:
             self._error(400, f"{type(exc).__name__}: {exc}")
         except Exception as exc:  # noqa: BLE001 - keep the API alive

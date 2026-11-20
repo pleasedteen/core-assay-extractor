@@ -94,7 +94,7 @@ code { background:#eef2f7; padding:1px 5px; border-radius:4px; }
       <textarea id="run-pages" spellcheck="false" style="min-height:150px"></textarea>
     </div>
     <div class="card">
-      <h2>运行状态（失败运行不会替换已确认基线；检查点支持中断续跑）</h2>
+      <h2>运行状态（同 ID 重试自动接回原运行；不同请求/已确认基线占用 ID 返回冲突；检查点支持中断续跑）</h2>
       <table class="grid" id="runs-table"><thead><tr>
         <th>运行 ID</th><th>规则</th><th>状态</th><th>冲突</th><th>警告</th><th>快照</th><th>开始</th><th>操作</th>
       </tr></thead><tbody></tbody></table>

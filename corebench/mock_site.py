@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List
 
@@ -336,19 +337,31 @@ def render_index() -> str:
 class _MockState:
     def __init__(self) -> None:
         self.fail_pages: set = set()
+        # page_id -> seconds to block before replying (simulates a slow page).
+        self.delays: Dict[str, float] = {}
         self.lock = threading.Lock()
 
     def fail(self, page_ids: List[str]) -> None:
         with self.lock:
             self.fail_pages.update(page_ids)
 
+    def delay(self, page_ids: List[str], seconds: float) -> None:
+        with self.lock:
+            for page_id in page_ids:
+                self.delays[page_id] = seconds
+
     def reset(self) -> None:
         with self.lock:
             self.fail_pages.clear()
+            self.delays.clear()
 
     def is_failing(self, page_id: str) -> bool:
         with self.lock:
             return page_id in self.fail_pages
+
+    def delay_for(self, page_id: str) -> float:
+        with self.lock:
+            return self.delays.get(page_id, 0.0)
 
 
 STATE = _MockState()
@@ -374,6 +387,9 @@ class MockHandler(BaseHTTPRequestHandler):
             if STATE.is_failing(page_id):
                 self._reply(500, "simulated server failure")
                 return
+            wait = STATE.delay_for(page_id)
+            if wait:
+                time.sleep(wait)
             for page in DATASET.get(borehole, []):
                 if page["page_id"] == page_id:
                     self._reply(200, render_page(borehole, page, layout_b=layout_b))
@@ -387,6 +403,12 @@ class MockHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
             STATE.fail(payload.get("page_ids", []))
+            self._reply(200, json.dumps({"ok": True}))
+            return
+        if self.path == "/_control/delay":
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            STATE.delay(payload.get("page_ids", []), float(payload.get("seconds", 1.0)))
             self._reply(200, json.dumps({"ok": True}))
             return
         if self.path == "/_control/reset":
