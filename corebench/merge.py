@@ -16,7 +16,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from .extractor import PageExtraction
+from .extractor import PageExtraction, borehole_id_of, extract_page
 from .values import values_equivalent
 
 
@@ -59,22 +59,41 @@ class BoreholeDocument:
 
 
 def merge_extractions(extractions: List[PageExtraction]) -> List[BoreholeDocument]:
+    """Merge a batch of in-memory extractions (small batches / unit tests).
+
+    Large crawls use :func:`write_snapshot_jsonl`, which performs exactly the
+    same per-borehole merge one page at a time.
+    """
     docs: Dict[str, BoreholeDocument] = {}
-    for extraction in sorted(extractions, key=lambda e: e.page_id):  # deterministic; order independent result
-        doc = docs.setdefault(extraction.borehole_id or f"unknown:{extraction.page_id}",
-                              BoreholeDocument(borehole_id=extraction.borehole_id or "unknown"))
-        doc.page_ids.append(extraction.page_id)
-        for warning in extraction.warnings:
-            doc.warnings.append(warning.to_dict())
-        _merge_records(doc.intervals, extraction.intervals, doc, kind="interval")
-        _merge_records(doc.samples, extraction.samples, doc, kind="sample")
-        _merge_measurements(doc, extraction.measurements)
+    for extraction in sorted(extractions, key=lambda e: e.page_id):
+        key = extraction.borehole_id or f"unknown:{extraction.page_id}"
+        doc = docs.setdefault(key, BoreholeDocument(borehole_id=extraction.borehole_id or "unknown"))
+        merge_extraction_into(doc, extraction)
     for doc in docs.values():
-        doc.intervals.sort(key=lambda r: r.get("identity", ""))
-        doc.samples.sort(key=lambda r: r.get("identity", ""))
-        doc.measurements.sort(key=lambda m: m["identity"])
-        doc.page_ids.sort()
+        finalize_document(doc)
     return [docs[key] for key in sorted(docs)]
+
+
+def merge_extraction_into(doc: BoreholeDocument, extraction: PageExtraction) -> None:
+    """Fold one page into a borehole document.
+
+    Callers must feed pages of one borehole in ``page_id`` order: that is the
+    order the batch merge uses, so conflict value pairs and provenance
+    (``page_ids`` / ``also_seen_in``) stay byte-identical to a continuous feed.
+    """
+    doc.page_ids.append(extraction.page_id)
+    for warning in extraction.warnings:
+        doc.warnings.append(warning.to_dict())
+    _merge_records(doc.intervals, extraction.intervals, doc, kind="interval")
+    _merge_records(doc.samples, extraction.samples, doc, kind="sample")
+    _merge_measurements(doc, extraction.measurements)
+
+
+def finalize_document(doc: BoreholeDocument) -> None:
+    doc.intervals.sort(key=lambda r: r.get("identity", ""))
+    doc.samples.sort(key=lambda r: r.get("identity", ""))
+    doc.measurements.sort(key=lambda m: m["identity"])
+    doc.page_ids.sort()
 
 
 def _merge_records(bucket: List[Dict[str, Any]], incoming: List[Dict[str, Any]],
@@ -156,6 +175,46 @@ def write_jsonl(documents: List[BoreholeDocument], path: str) -> str:
         for doc in documents:
             handle.write(json.dumps(doc.to_jsonl_obj(), ensure_ascii=False, sort_keys=True) + "\n")
     return path
+
+
+def iter_snapshot_documents(snapshot, rule):
+    """Stream merged documents for a frozen snapshot, one borehole at a time.
+
+    Pages may be stored interleaved across boreholes; each borehole is merged
+    in ``page_id`` order, which is exactly the order :func:`merge_extractions`
+    uses, so complementary measurements, conflict value pairs and provenance
+    are identical to a continuous single-borehole feed.  Only one page's DOM
+    and one borehole document are resident at a time.
+
+    Two cheap passes keep memory flat: the first reads only each page's
+    borehole heading (no table extraction), the second extracts one page at a
+    time.  The snapshot's own ``iter_pages`` stays sorted by ``page_id``; the
+    grouping pass is what makes interleaved arrival order irrelevant.
+    """
+    groups: Dict[str, List[str]] = {}
+    for page in snapshot.iter_pages():
+        key = borehole_id_of(page, rule) or f"unknown:{page.page_id}"
+        groups.setdefault(key, []).append(page.page_id)
+
+    for key in sorted(groups):
+        doc = BoreholeDocument(borehole_id=key)
+        for page_id in sorted(groups[key]):
+            page = snapshot.get(page_id)
+            merge_extraction_into(doc, extract_page(page, rule))
+        finalize_document(doc)
+        yield doc
+
+
+def write_snapshot_jsonl(snapshot, rule, path: str) -> Dict[str, bool]:
+    """Stream :func:`iter_snapshot_documents` into canonical JSON Lines."""
+    has_conflicts = False
+    has_warnings = False
+    with open(path, "w", encoding="utf-8") as handle:
+        for doc in iter_snapshot_documents(snapshot, rule):
+            has_conflicts = has_conflicts or bool(doc.conflicts)
+            has_warnings = has_warnings or bool(doc.warnings)
+            handle.write(json.dumps(doc.to_jsonl_obj(), ensure_ascii=False, sort_keys=True) + "\n")
+    return {"has_conflicts": has_conflicts, "has_warnings": has_warnings}
 
 
 def read_jsonl(path: str) -> List[Dict[str, Any]]:

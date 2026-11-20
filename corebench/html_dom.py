@@ -48,7 +48,10 @@ class Node:
     attrs: Dict[str, str] = field(default_factory=dict)
     children: List["Node"] = field(default_factory=list)
     text: str = ""
-    parent: Optional["Node"] = None
+    # No back-reference to the parent: the tree is acyclic, so a finished page
+    # DOM is freed by plain reference counting the moment extraction ends.
+    # Cyclic parent links would leave every page waiting for a generational GC
+    # pass, making peak memory grow with the number of crawled pages.
 
     # -- navigation helpers -------------------------------------------------
     def iter_descendants(self, tag: Optional[str] = None):
@@ -130,7 +133,7 @@ def parse_html(markup: str) -> Node:
         if match.start() > pos:
             text = markup[pos:match.start()]
             if text:
-                stack[-1].children.append(Node(tag="#text", text=html_mod.unescape(text), parent=stack[-1]))
+                stack[-1].children.append(Node(tag="#text", text=html_mod.unescape(text)))
         is_close = match.group(1) == "/"
         tag = match.group(2).lower()
         attr_text = match.group(3) or ""
@@ -147,7 +150,7 @@ def parse_html(markup: str) -> Node:
         if tag in RAW_TAGS:
             end = re.search(rf"</\s*{tag}\s*>", markup[match.end():], re.IGNORECASE)
             raw = markup[match.end():match.end() + end.start()] if end else markup[match.end():]
-            node = Node(tag=tag, attrs=_parse_attrs(attr_text), text=raw, parent=stack[-1])
+            node = Node(tag=tag, attrs=_parse_attrs(attr_text), text=raw)
             stack[-1].children.append(node)
             if not end:
                 # Unclosed raw element: consume the rest of the document.
@@ -157,12 +160,12 @@ def parse_html(markup: str) -> Node:
             continue
 
         close_until(tag)
-        node = Node(tag=tag, attrs=_parse_attrs(attr_text), parent=stack[-1])
+        node = Node(tag=tag, attrs=_parse_attrs(attr_text))
         stack[-1].children.append(node)
         if tag not in VOID_TAGS and not self_closing:
             stack.append(node)
         pos = match.end()
 
     if pos < len(markup):
-        root.children.append(Node(tag="#text", text=html_mod.unescape(markup[pos:]), parent=root))
+        root.children.append(Node(tag="#text", text=html_mod.unescape(markup[pos:])))
     return root

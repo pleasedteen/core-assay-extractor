@@ -128,7 +128,12 @@ def extract_page(page, rule: Rule) -> PageExtraction:
     return result
 
 
-def _extract_borehole_id(root: Node, rule: Rule, result: PageExtraction) -> Optional[str]:
+def borehole_id_of(page, rule: Rule) -> Optional[str]:
+    """Read only the borehole id from a page (no record extraction)."""
+    return _extract_borehole_id(parse_html(page.html), rule, None)
+
+
+def _extract_borehole_id(root: Node, rule: Rule, result: Optional[PageExtraction]) -> Optional[str]:
     for node in select_nodes(root, rule.borehole_selector):
         text = node.normalize_text()
         for label in rule.borehole_labels:
@@ -137,8 +142,9 @@ def _extract_borehole_id(root: Node, rule: Rule, result: PageExtraction) -> Opti
                 return match.group(1)
         if text and not rule.borehole_labels:
             return text
-    result.warnings.append(Warning_("BOREHOLE_ID_MISSING", "borehole id could not be located",
-                                    result.page_id))
+    if result is not None:
+        result.warnings.append(Warning_("BOREHOLE_ID_MISSING", "borehole id could not be located",
+                                        result.page_id))
     return None
 
 

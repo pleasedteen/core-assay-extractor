@@ -24,8 +24,9 @@ python3 -I demo.py
 python3 -I run_tests.py
 ```
 
-47 个用例覆盖：嵌套归属、脏表格、跨页互补与冲突、单位等价、检出限/零/缺失语义、
-分页中途失败与续跑、规则版本固定、基线拦截、不完整快照不得回归通过、Web API 与界面资源。
+59 个用例覆盖：嵌套归属、脏表格、跨页互补与冲突、单位等价、检出限/零/缺失语义、
+分页中途失败与续跑、规则版本固定、基线拦截、不完整快照不得回归通过、Web API 与界面资源，
+以及大批量路径（交错分页等价性、内存与写入预算、仅补抓未落盘页面）。
 
 ## 启动 Web 界面
 
@@ -51,9 +52,9 @@ corebench/
   values.py       值/单位语义（检出限、零、缺失；m/cm、mg/kg 与 ug/kg 归一）
   rules.py        规则模型：层级、字段含义、记录身份、表头/分析项/方法别名
   extractor.py    单页抽取（宽表与长表、行级溯源、无法解释列告警）
-  sources.py      HTTP/文件来源、内容哈希与快照存储
-  merge.py        跨页身份合并（顺序无关、互补测量、矛盾冲突）、JSONL 读写
-  runner.py       运行引擎（检查点/续跑、规则版本固定、快照回放）
+  sources.py      HTTP/文件来源、内容哈希与逐页快照存储（索引 + 单页文件，懒加载）
+  merge.py        跨页身份合并（顺序无关、互补测量、矛盾冲突）、按孔流式 JSONL 写出
+  runner.py       运行引擎（逐页检查点/续跑、规则版本固定、快照回放）
   storage.py      规则版本/运行/基线/报告的文件存储（原子写入）
   diff.py         语义差异与基线、回归报告
   mock_site.py    模拟钻孔档案站点（脏 HTML、双布局、失败开关）
@@ -62,7 +63,7 @@ corebench/
 tests/
   fixtures/rules/rule_v1.dsl, rule_v2.dsl     两版声明式规则
   fixtures/expected/expected.jsonl            人工编写的期望结果
-  test_*.py                                    47 个自动验证用例
+  test_*.py                                    59 个自动验证用例（含 test_large_batch.py）
 demo.py / serve.py / run_tests.py             演示、启动、测试入口
 ```
 
@@ -97,3 +98,7 @@ methods:
   不能替换已确认基线；不完整快照的回归结论一律不通过。
 * **可追溯**：每条记录与错误都带 `page_id`、`url`、页面 `content_sha1`、表选择器、原始行/单元格文本
   与规则版本，界面可直接查看对应原页 HTML。
+* **大批量路径**：快照按页落盘（`<snapshot>/pages/<page_id>.json` + 追加式 `index.jsonl`），
+  每页只写自身字节，不再整批重写；采集与回放都一次只驻留一页 DOM 和一个钻孔文档。
+  不同钻孔的分页可以交错到达，同一钻孔始终按 `page_id` 顺序合并，因此互补测量、冲突值对
+  与溯源（`page_ids` / `also_seen_in`）与连续输入完全一致。续跑只补抓索引中不存在的页面。

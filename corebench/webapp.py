@@ -76,12 +76,13 @@ class WorkbenchApp:
         return regression_report(self.store, baseline, candidate)
 
     def snapshot_page(self, snapshot_id: str, page_id: str) -> Optional[Dict[str, Any]]:
-        snapshot = self.snapshots.load(snapshot_id)
-        page = snapshot.get(page_id)
+        # Read one page directly: no need to index the whole frozen corpus.
+        page = self.snapshots.load_page_by_id(snapshot_id, page_id)
         if page is None:
             return None
         return {"page_id": page.page_id, "url": page.url, "html": page.html,
-                "content_sha1": page.content_sha1, "failures": snapshot.failures}
+                "content_sha1": page.content_sha1,
+                "failures": self.snapshots.load_failures(snapshot_id)}
 
 
 class ApiHandler(BaseHTTPRequestHandler):

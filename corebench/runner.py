@@ -1,21 +1,24 @@
 """Collection runner with checkpoint/resume and pinned rule versions.
 
 A run walks a manifest of (page_id, url) entries and stores each fetched raw
-page into the run's snapshot.  Progress is checkpointed after every page, so an
-interrupted run can resume without re-fetching completed pages.  The rule text
-is copied into the run at start time: saving a new rule version while the run
-is in progress has no effect on it.
+page into the run's snapshot.  Progress is checkpointed after every page (a
+single page file plus one appended index line), so an interrupted run can
+resume without re-fetching completed pages.  Pages from different boreholes may
+arrive interleaved; each page is merged into its borehole in ``page_id`` order
+at the end, which keeps complementary measurements, conflict values and
+provenance identical to a continuous single-borehole feed.  The rule text is
+copied into the run at start time: saving a new rule version while the run is
+in progress has no effect on it.
 """
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
-from .extractor import PageExtraction, extract_page
-from .merge import BoreholeDocument, has_blocking_conflicts, merge_extractions, write_jsonl
+from .merge import write_snapshot_jsonl
 from .rules import Rule
-from .sources import PageContent, Snapshot, SnapshotStore, SourceError, fetch_page
+from .sources import PageContent, SnapshotStore, SourceError, fetch_page
 
 STATUS_PENDING = "pending"
 STATUS_RUNNING = "running"
@@ -65,19 +68,29 @@ class RunEngine:
     def run(self, run_id: str) -> Dict[str, Any]:
         """Execute (or resume) the run until completion or first fetch error."""
         run = self.store.load_run(run_id)
+        # The durable per-page checkpoint is the snapshot itself: one page file
+        # plus one appended index line.  run.json is O(manifest) and is written
+        # only at terminal transitions, so a crawl never re-serialises either
+        # the corpus or the whole manifest once per page.  Resume derives the
+        # completed set from the snapshot, not from run["pages"].
+        # Status changes are recorded at terminal transitions only (completed /
+        # failed).  A crash mid-crawl leaves the last durable state alone; the
+        # snapshot index, not run.json, is what resume consults.
         run["status"] = STATUS_RUNNING
-        self.store.save_run(run)
 
-        snapshot = Snapshot(snapshot_id=run["snapshot_id"])
-        if self.snapshot_store.exists(snapshot.snapshot_id):
-            snapshot = self.snapshot_store.load(snapshot.snapshot_id)
-        done_ids = {page.page_id for page in snapshot.pages}
+        snapshot = self.snapshot_store.load_or_create(run["snapshot_id"])
+        # Pages already frozen by an earlier attempt are never re-fetched.
+        done_ids = set(snapshot.page_ids())
 
         rule = Rule.from_text(run["rule_text"])
         try:
             for entry in run["pages"]:
-                if entry["page_id"] in done_ids or entry["state"] == STATUS_COMPLETED:
+                if entry["page_id"] in done_ids:
                     continue
+                if entry["state"] == STATUS_COMPLETED:
+                    # Completed in a run record whose snapshot page is gone:
+                    # re-fetch rather than silently claiming a page we lack.
+                    entry["state"] = STATUS_PENDING
                 try:
                     page = self.fetcher(entry["page_id"], entry["url"])
                 except SourceError as exc:
@@ -89,29 +102,29 @@ class RunEngine:
                     run["error"] = str(exc)
                     self.store.save_run(run)
                     return run
-                # A retried page that now succeeds clears its failure marker.
-                snapshot.failures.pop(entry["page_id"], None)
-                snapshot.pages.append(page)
+                # Persist just this page: the raw HTML is written once and the
+                # index line is appended, never the whole corpus rewritten.
+                # The page file plus its index line are the durable checkpoint,
+                # so neither run.json nor meta.json is rewritten per page.
+                snapshot.add_page(page)
+                del page
                 entry["state"] = STATUS_COMPLETED
                 entry["error"] = None
-                done_ids.add(page.page_id)
-                # Checkpoint after every page: resumption needs no re-fetch.
-                self.snapshot_store.save(snapshot)
-                self.store.save_run(run)
+                done_ids.add(entry["page_id"])
+                # A retried page that now succeeds clears its failure marker;
+                # persist that at once so a later crash cannot resurrect it.
+                self.snapshot_store.clear_failures(snapshot)
 
-            extractions = [extract_page(page, rule) for page in
-                           sorted(snapshot.pages, key=lambda p: p.page_id)]
-            documents = merge_extractions(extractions)
             output_path = self.store.run_output_path(run_id)
-            write_jsonl(documents, output_path)
+            # Stream: one page's DOM and one borehole document in memory at a time.
+            outcome = write_snapshot_jsonl(snapshot, rule, output_path)
 
             run["status"] = STATUS_COMPLETED
             run["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            run["has_conflicts"] = has_blocking_conflicts(documents)
-            run["has_warnings"] = any(doc.warnings for doc in documents)
+            run["has_conflicts"] = outcome["has_conflicts"]
+            run["has_warnings"] = outcome["has_warnings"]
             run["output_path"] = output_path
             self.store.save_run(run)
-            self.snapshot_store.save(snapshot)
             return run
         except Exception as exc:  # noqa: BLE001 - mark run failed, keep checkpoint
             run["status"] = STATUS_FAILED
@@ -127,12 +140,9 @@ class RunEngine:
         snapshot = self.snapshot_store.load(original["snapshot_id"])
         text = rule_text if rule_text is not None else original["rule_text"]
         rule = Rule.from_text(text)
-        extractions = [extract_page(page, rule) for page in
-                       sorted(snapshot.pages, key=lambda p: p.page_id)]
-        documents = merge_extractions(extractions)
         replay_id = new_run_id or f"{run_id}-replay-{int(time.time() * 1000)}"
         output_path = self.store.run_output_path(replay_id)
-        write_jsonl(documents, output_path)
+        outcome = write_snapshot_jsonl(snapshot, rule, output_path)
         replay_run = {
             "run_id": replay_id,
             "rule_id": original["rule_id"] if rule_text is None else f"{original['rule_id']}:candidate",
@@ -143,8 +153,8 @@ class RunEngine:
             "snapshot_id": snapshot.snapshot_id,
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "has_conflicts": has_blocking_conflicts(documents),
-            "has_warnings": any(doc.warnings for doc in documents),
+            "has_conflicts": outcome["has_conflicts"],
+            "has_warnings": outcome["has_warnings"],
             "output_path": output_path,
             "error": None,
             "replayed_from": run_id,

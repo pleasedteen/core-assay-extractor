@@ -12,12 +12,14 @@ import time
 from typing import Any, Dict, List, Optional
 
 
-def _atomic_write_json(path: str, payload: Any) -> None:
+def _atomic_write_json(path: str, payload: Any) -> int:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
+    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
     with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write(text)
     os.replace(tmp, path)
+    return len(text.encode("utf-8"))
 
 
 def _read_json(path: str) -> Any:
@@ -28,6 +30,9 @@ def _read_json(path: str) -> Any:
 class WorkbenchStore:
     def __init__(self, root: str):
         self.root = os.path.abspath(root)
+        # Bytes handed to disk for run checkpoints (rule/baseline writes are
+        # one-off and not part of the crawl write budget).
+        self.bytes_written = 0
         self.rules_dir = os.path.join(self.root, "rules")
         self.runs_dir = os.path.join(self.root, "runs")
         self.snapshots_dir = os.path.join(self.root, "snapshots")
@@ -71,7 +76,7 @@ class WorkbenchStore:
         return os.path.join(self.runs_dir, run_id, "run.json")
 
     def save_run(self, run: Dict[str, Any]) -> None:
-        _atomic_write_json(self.run_path(run["run_id"]), run)
+        self.bytes_written += _atomic_write_json(self.run_path(run["run_id"]), run)
 
     def load_run(self, run_id: str) -> Dict[str, Any]:
         return _read_json(self.run_path(run_id))
