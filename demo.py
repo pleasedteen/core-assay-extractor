@@ -20,6 +20,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import urllib.request
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -132,8 +134,36 @@ def main() -> int:
     report_path = store.save_report("demo-change-report", changed)
     print(f"  机器可读报告已导出: {report_path}")
 
-    # ------------------------------------------------------------- 6. outputs
-    hr("6. 产物清单")
+    # ------------------------------------------------- 6. HTTP 429 rate limit
+    hr("6. HTTP 429 限流：按 Retry-After 时点等待，同站运行共享，重启后仍生效")
+    limited_state = mock_site.MockState()
+    limited_server, limited_url = mock_site.start_mock_server(state=limited_state)
+    held_manifest = [
+        {"page_id": "zk01-p1", "url": f"{limited_url}/site/ZK01/zk01-p1"},
+        {"page_id": "zk02-p1", "url": f"{base_url}/site/ZK02/zk02-p1"},
+    ]
+    engine.start(RunConfig("limited", v1["rule_id"], v1["text"], held_manifest))
+    limited_state.set_rate_limit(1.2)  # 站点在 1.2 秒内对所有页面返回 429 + Retry-After
+    other_before = mock_site.STATE.request_count()
+    outcome = {}
+    worker = threading.Thread(target=lambda: outcome.setdefault("run", engine.run("limited")))
+    started = time.time()
+    worker.start()
+    time.sleep(0.6)  # 等待窗口内观察
+    mid = store.load_run("limited")
+    print(f"  等待期间: 运行状态 {mid['status']} (waiting_until={mid['waiting_until']})，"
+          f"受限站点请求数 {limited_state.request_count()}（仅最初那次 429），"
+          f"另一站点新增请求 {mock_site.STATE.request_count() - other_before}（其他站点继续采集）")
+    worker.join()
+    limited_run = outcome["run"]
+    print(f"  约 {time.time() - started:.1f}s 后自动恢复: 状态 {limited_run['status']}，"
+          f"受限站点总请求 {limited_state.request_count()}（恢复后只补抓未完成页）")
+    print(f"  限流时点已持久化: {os.path.join(data_dir, 'rate_limits.json')}"
+          "（同站多个运行共享，服务重启后仍按原时点生效）")
+    limited_server.shutdown()
+
+    # ------------------------------------------------------------- 7. outputs
+    hr("7. 产物清单")
     print(f"  JSON Lines 输出:   {run['output_path']}")
     print(f"  快照目录:          {snapshots.root}")
     print(f"  基线目录:          {store.baselines_dir}")

@@ -4,7 +4,10 @@ Nothing here talks to a real external host.  The site serves deliberately dirty
 HTML: unclosed ``td``/``tr`` tags, ``rowspan``/``colspan`` merged cells,
 two-layer headers, units written only in headers, mixed metres/centimetres and
 mg/kg / ug/kg, detection-limit values (``<0.05``), measured zeros and missing
-cells.  A failure switch simulates an aborted page fetch mid-crawl.
+cells.  A failure switch simulates an aborted page fetch mid-crawl, a rate
+switch answers HTTP 429 with ``Retry-After`` for a configurable window, a
+``/redirect?to=`` route issues cross-site redirects, and every request is
+counted so tests can prove a held site receives zero traffic.
 
 Two layouts are provided so the second rule version can demonstrate purely
 declarative adaptation (renamed labels, different classes/units) without any
@@ -13,9 +16,12 @@ Python change.
 from __future__ import annotations
 
 import json
+import math
 import threading
+import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 # --------------------------------------------------------------------- data
 # Each measurement tuple: (sample_id, analyte, method, value_text, unit)
@@ -333,10 +339,15 @@ def render_index() -> str:
 
 
 # ------------------------------------------------------------------ server
-class _MockState:
-    def __init__(self) -> None:
+class MockState:
+    """Per-server switches: failing pages, a 429 window and a request log."""
+
+    def __init__(self, clock=time.time) -> None:
         self.fail_pages: set = set()
         self.lock = threading.Lock()
+        self.limited_until = 0.0
+        self.request_log: List[tuple] = []  # (epoch, path) of every GET
+        self.clock = clock
 
     def fail(self, page_ids: List[str]) -> None:
         with self.lock:
@@ -345,21 +356,56 @@ class _MockState:
     def reset(self) -> None:
         with self.lock:
             self.fail_pages.clear()
+            self.limited_until = 0.0
 
     def is_failing(self, page_id: str) -> bool:
         with self.lock:
             return page_id in self.fail_pages
 
+    # ------------------------------------------------------- rate limiting --
+    def set_rate_limit(self, retry_after_seconds: float) -> None:
+        """Answer every page request with 429 + Retry-After for this long."""
+        with self.lock:
+            self.limited_until = self.clock() + retry_after_seconds
 
-STATE = _MockState()
+    def retry_after_remaining(self) -> float:
+        with self.lock:
+            return max(0.0, self.limited_until - self.clock())
+
+    # ------------------------------------------------------------ counting --
+    def log_request(self, path: str) -> None:
+        with self.lock:
+            self.request_log.append((self.clock(), path))
+
+    def request_count(self, contains: Optional[str] = None,
+                      since: Optional[float] = None) -> int:
+        with self.lock:
+            entries = list(self.request_log)
+        return sum(1 for moment, path in entries
+                   if (contains is None or contains in path)
+                   and (since is None or moment >= since))
+
+
+STATE = MockState()
 
 
 class MockHandler(BaseHTTPRequestHandler):
+    state = STATE  # bound per server by start_mock_server
+
     def log_message(self, *args):  # silence test server logging
         pass
 
     def do_GET(self):  # noqa: N802 (stdlib API)
-        path = self.path
+        self.state.log_request(self.path)
+        path, _, query = self.path.partition("?")
+        if path == "/redirect":
+            # Cross-site redirector: /redirect?to=<url> issues a 302.
+            target = urllib.parse.parse_qs(query).get("to", [""])[0]
+            if not target:
+                self._reply(400, "missing to= parameter")
+                return
+            self._redirect(target)
+            return
         if path in ("/", "/index.html"):
             self._reply(200, render_index())
             return
@@ -371,7 +417,12 @@ class MockHandler(BaseHTTPRequestHandler):
                 self._reply(404, "not found")
                 return
             borehole, page_id = parts
-            if STATE.is_failing(page_id):
+            remaining = self.state.retry_after_remaining()
+            if remaining > 0:
+                self._reply(429, "simulated rate limit",
+                            headers={"Retry-After": str(math.ceil(remaining))})
+                return
+            if self.state.is_failing(page_id):
                 self._reply(500, "simulated server failure")
                 return
             for page in DATASET.get(borehole, []):
@@ -386,26 +437,43 @@ class MockHandler(BaseHTTPRequestHandler):
         if self.path == "/_control/fail":
             length = int(self.headers.get("Content-Length", "0"))
             payload = json.loads(self.rfile.read(length) or b"{}")
-            STATE.fail(payload.get("page_ids", []))
+            self.state.fail(payload.get("page_ids", []))
+            self._reply(200, json.dumps({"ok": True}))
+            return
+        if self.path == "/_control/rate_limit":
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            self.state.set_rate_limit(float(payload.get("retry_after", 0)))
             self._reply(200, json.dumps({"ok": True}))
             return
         if self.path == "/_control/reset":
-            STATE.reset()
+            self.state.reset()
             self._reply(200, json.dumps({"ok": True}))
             return
         self._reply(404, "not found")
 
-    def _reply(self, status: int, body: str, content_type: str = "text/html; charset=utf-8") -> None:
+    def _redirect(self, target: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", target)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _reply(self, status: int, body: str, content_type: str = "text/html; charset=utf-8",
+               headers: Optional[Dict[str, str]] = None) -> None:
         encoded = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(encoded)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(encoded)
 
 
-def start_mock_server(host: str = "127.0.0.1", port: int = 0):
-    server = ThreadingHTTPServer((host, port), MockHandler)
+def start_mock_server(host: str = "127.0.0.1", port: int = 0,
+                      state: Optional[MockState] = None):
+    handler = type("BoundMockHandler", (MockHandler,), {"state": state or STATE})
+    server = ThreadingHTTPServer((host, port), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, f"http://{host}:{server.server_address[1]}"
